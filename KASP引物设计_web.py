@@ -852,13 +852,6 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
             break
     
     return unique_schemes
-        if key not in seen:
-            seen.add(key)
-            unique_schemes.append(scheme)
-            if len(unique_schemes) >= num_schemes:
-                break
-    
-    return unique_schemes
 
 
 # ==================== 常规PCR引物设计 ====================
@@ -1091,12 +1084,20 @@ def evaluate_primer_quality_strict(seq: str, config) -> Dict:
 def design_regular_primers(sequence: str, config: RegularPCRConfig = None, 
                           num_pairs: int = 5, target_start: int = None, 
                           target_end: int = None) -> List[Dict]:
-    """设计常规PCR引物对 - 优化版（支持小麦模式）"""
+    """
+    设计常规PCR引物对 - 优化版（支持小麦模式）
+    确保不产生重复引物对，质量不达标时返回空列表
+    """
     if config is None:
         config = RegularPCRConfig()
     
     sequence = re.sub(r'[^ATGC]', '', sequence.upper())
     seq_len = len(sequence)
+    
+    # 序列太短直接返回空
+    min_required_len = config.PRODUCT_MIN + 2 * config.MIN_PRIMER_LEN
+    if seq_len < min_required_len:
+        return []  # 序列太短，无法设计
     
     # === 小麦模式：避开5'端保守区 ===
     wheat_avoid_region = 0
@@ -1127,6 +1128,10 @@ def design_regular_primers(sequence: str, config: RegularPCRConfig = None,
         if config.WHEAT_MODE and target_start < wheat_avoid_region:
             # 调整目标起始位置
             target_start = max(target_start, wheat_avoid_region)
+    
+    # 确保目标区域有效
+    if target_end <= target_start or target_end - target_start < config.PRODUCT_MIN:
+        return []  # 目标区域无效
     
     all_pairs = []
     
