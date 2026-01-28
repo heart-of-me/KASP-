@@ -139,22 +139,101 @@ def calc_gc_content(seq: str) -> float:
     return (gc / len(seq)) * 100 if len(seq) > 0 else 0
 
 
-def calc_tm_nearest_neighbor(seq: str, na_conc: float = 50.0) -> float:
+def calc_tm_nearest_neighbor(seq: str, na_conc: float = 50.0, primer_conc: float = 250.0) -> float:
     """
-    使用简化的经验公式计算Tm值
+    使用最近邻法(Nearest-Neighbor)计算Tm值
+    这是目前最准确的Tm计算方法，与实际实验值偏差通常<2°C
+    
+    参数:
+        seq: 引物序列
+        na_conc: Na+浓度 (mM)，默认50mM
+        primer_conc: 引物浓度 (nM)，默认250nM
+    
+    参考: SantaLucia J Jr. (1998) PNAS 95:1460-1465
     """
     seq = seq.upper()
     length = len(seq)
     
-    if length < 14:
+    if length < 8:
+        # 序列过短，使用简单公式
         gc_count = seq.count('G') + seq.count('C')
         at_count = seq.count('A') + seq.count('T')
-        tm = 2 * at_count + 4 * gc_count
+        return round(2 * at_count + 4 * gc_count, 1)
+    
+    # 最近邻热力学参数 (ΔH kcal/mol, ΔS cal/mol·K)
+    # SantaLucia 1998 统一参数
+    nn_params = {
+        'AA': (-7.9, -22.2), 'TT': (-7.9, -22.2),
+        'AT': (-7.2, -20.4),
+        'TA': (-7.2, -21.3),
+        'CA': (-8.5, -22.7), 'TG': (-8.5, -22.7),
+        'GT': (-8.4, -22.4), 'AC': (-8.4, -22.4),
+        'CT': (-7.8, -21.0), 'AG': (-7.8, -21.0),
+        'GA': (-8.2, -22.2), 'TC': (-8.2, -22.2),
+        'CG': (-10.6, -27.2),
+        'GC': (-9.8, -24.4),
+        'GG': (-8.0, -19.9), 'CC': (-8.0, -19.9),
+    }
+    
+    # 起始参数
+    init_params = {
+        'G': (0.1, -2.8), 'C': (0.1, -2.8),
+        'A': (2.3, 4.1), 'T': (2.3, 4.1)
+    }
+    
+    # 计算ΔH和ΔS
+    dH = 0.0  # kcal/mol
+    dS = 0.0  # cal/mol·K
+    
+    # 起始贡献
+    if seq[0] in init_params:
+        dH += init_params[seq[0]][0]
+        dS += init_params[seq[0]][1]
+    if seq[-1] in init_params:
+        dH += init_params[seq[-1]][0]
+        dS += init_params[seq[-1]][1]
+    
+    # 最近邻贡献
+    for i in range(length - 1):
+        dinuc = seq[i:i+2]
+        if dinuc in nn_params:
+            dH += nn_params[dinuc][0]
+            dS += nn_params[dinuc][1]
+    
+    # 盐浓度校正 (von Ahsen 2001)
+    # ΔS_corrected = ΔS + 0.368 * N * ln([Na+])
+    import math
+    na_molar = na_conc / 1000.0  # 转换为M
+    dS_corrected = dS + 0.368 * (length - 1) * math.log(na_molar)
+    
+    # 计算Tm
+    # Tm = ΔH / (ΔS + R * ln(Ct/4)) - 273.15
+    # R = 1.987 cal/mol·K
+    R = 1.987
+    ct = primer_conc * 1e-9  # 转换为M
+    
+    tm = (dH * 1000) / (dS_corrected + R * math.log(ct / 4)) - 273.15
+    
+    return round(tm, 1)
+
+
+def calc_tm_simple(seq: str) -> float:
+    """
+    使用改进的Wallace公式计算Tm值（用于快速筛选）
+    适用于14-30bp的引物
+    """
+    seq = seq.upper()
+    length = len(seq)
+    gc_count = seq.count('G') + seq.count('C')
+    
+    if length < 14:
+        # Wallace公式
+        tm = 2 * (length - gc_count) + 4 * gc_count
     else:
-        gc_percent = calc_gc_content(seq)
-        tm = 81.5 + 0.41 * gc_percent - 675 / length
-        salt_correction = 16.6 * (0.69897 + (-3.0))  # log10(0.001) ≈ -3
-        tm = tm + salt_correction * 0.1
+        # 改进的公式，考虑长度影响
+        gc_percent = (gc_count / length) * 100
+        # Primer3使用的公式变体
+        tm = 64.9 + 41 * (gc_count - 16.4) / length
     
     return round(tm, 1)
 
@@ -564,9 +643,19 @@ def parse_snp_sequence(seq_with_snp: str) -> Tuple[str, str, str, str]:
 
 def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, allele2: str, 
                               config: KASPConfig = None, num_schemes: int = 5) -> List[Dict]:
-    """设计多套KASP引物方案 - 小麦优化版"""
+    """
+    设计多套KASP引物方案 - 优化版
+    确保不产生重复引物，质量不达标时返回空列表
+    """
     if config is None:
         config = KASPConfig()
+    
+    # 检查序列长度是否足够
+    if len(upstream) < config.MIN_PRIMER_LEN:
+        return []  # 上游序列太短
+    
+    if len(downstream) < config.REV_MIN_DISTANCE + config.MIN_PRIMER_LEN:
+        return []  # 下游序列太短
     
     all_schemes = []
     
@@ -606,10 +695,22 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
             eval1 = evaluate_primer_quality(fwd_allele1, config)
             eval2 = evaluate_primer_quality(fwd_allele2, config)
             
+            # 质量过低的直接跳过
+            if eval1['score'] < 40 or eval2['score'] < 40:
+                continue
+            
             tm_diff = abs(eval1['tm'] - eval2['tm'])
             
+            # Tm差异过大直接跳过
+            if tm_diff > config.MAX_TM_DIFF + 1:
+                continue
+            
             # 搜索反向引物
-            for rev_dist in range(config.REV_MIN_DISTANCE, min(config.REV_MAX_DISTANCE + 1, len(downstream) - config.MIN_PRIMER_LEN + 1)):
+            max_rev_dist = min(config.REV_MAX_DISTANCE + 1, len(downstream) - config.MIN_PRIMER_LEN + 1)
+            if max_rev_dist <= config.REV_MIN_DISTANCE:
+                continue
+                
+            for rev_dist in range(config.REV_MIN_DISTANCE, max_rev_dist):
                 for rev_len in range(config.MIN_PRIMER_LEN, min(config.MAX_PRIMER_LEN + 1, len(downstream) - rev_dist + 1)):
                     rev_start = rev_dist
                     rev_end = rev_dist + rev_len
@@ -627,6 +728,10 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
                     
                     eval_rev = evaluate_primer_quality(rev_seq, config)
                     
+                    # 质量过低跳过
+                    if eval_rev['score'] < 40:
+                        continue
+                    
                     # 检查引物二聚体
                     has_dimer = (check_primer_dimer(fwd_allele1, rev_seq) or 
                                 check_primer_dimer(fwd_allele2, rev_seq))
@@ -639,8 +744,10 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
                     total_score = (avg_fwd_score * 0.4 + eval_rev['score'] * 0.3)
                     
                     # Tm匹配评分
-                    if tm_diff <= 1.0:
+                    if tm_diff <= 0.5:
                         total_score += 15
+                    elif tm_diff <= 1.0:
+                        total_score += 10
                     elif tm_diff <= 2.0:
                         total_score += 5
                     else:
@@ -674,13 +781,19 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
                     # 判断是否可用（小麦模式更严格）
                     is_usable = True
                     if config.WHEAT_MODE:
-                        # 小麦模式下的可用性标准
                         is_usable = (
                             total_score >= 50 and
                             product_size <= 120 and
-                            eval1['gc_content'] >= 30 and eval1['gc_content'] <= 65 and
-                            eval_rev['gc_content'] >= 30 and eval_rev['gc_content'] <= 65 and
-                            not has_dimer
+                            30 <= eval1['gc_content'] <= 65 and
+                            30 <= eval_rev['gc_content'] <= 65 and
+                            not has_dimer and
+                            tm_diff <= config.MAX_TM_DIFF
+                        )
+                    else:
+                        is_usable = (
+                            total_score >= 45 and
+                            not has_dimer and
+                            tm_diff <= config.MAX_TM_DIFF
                         )
                     
                     scheme = {
@@ -708,17 +821,37 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
                     }
                     all_schemes.append(scheme)
     
-    # 按评分排序并去重
-    # 小麦模式：优先可用的方案
+    # 如果没有找到任何方案，返回空列表
+    if not all_schemes:
+        return []
+    
+    # 按评分排序
     if config.WHEAT_MODE:
         all_schemes.sort(key=lambda x: (x.get('is_usable', False), x['total_score']), reverse=True)
     else:
         all_schemes.sort(key=lambda x: x['total_score'], reverse=True)
     
+    # 严格去重：确保每个方案的引物组合都是唯一的
     unique_schemes = []
-    seen = set()
+    seen_cores = set()  # 核心序列组合
+    seen_full = set()   # 完整引物组合
+    
     for scheme in all_schemes:
-        key = (scheme['fwd_allele1_core'], scheme['reverse'])
+        # 多重去重检查
+        core_key = (scheme['fwd_allele1_core'], scheme['reverse'])
+        full_key = (scheme['fwd_allele1_full'], scheme['fwd_allele2_full'], scheme['reverse'])
+        
+        if core_key in seen_cores or full_key in seen_full:
+            continue
+        
+        seen_cores.add(core_key)
+        seen_full.add(full_key)
+        unique_schemes.append(scheme)
+        
+        if len(unique_schemes) >= num_schemes:
+            break
+    
+    return unique_schemes
         if key not in seen:
             seen.add(key)
             unique_schemes.append(scheme)
