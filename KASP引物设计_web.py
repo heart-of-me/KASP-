@@ -111,6 +111,8 @@ class RegularPCRConfig:
     OPTIMAL_TM: float = 60.0
     MIN_GC: float = 40.0
     MAX_GC: float = 60.0
+    OPTIMAL_GC_MIN: float = 45.0
+    OPTIMAL_GC_MAX: float = 55.0
     MAX_TM_DIFF: float = 2.0
     PRODUCT_MIN: int = 150
     PRODUCT_MAX: int = 500
