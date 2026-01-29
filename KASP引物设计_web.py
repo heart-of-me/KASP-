@@ -2336,7 +2336,7 @@ GGAGACCCGCAAGGCGCTCGGATCGGCTTACCACTCCATGATGATGGTGGAGCAGGTCCACCTGGGGAAGAGCGCCAACT
    - 推荐用于：小麦KASP引物验证
 
 2. **Ensembl Plants BLAST（官方工具）**
-   - 地址：https://plants.ensembl.org/tools/blast
+   - 地址：https://plants.ensembl.org/Multi/Tools/Blast?db=core
    - 优点：官方权威，支持多个物种和基因组版本
    - 缺点：需要手动检查每个基因组
 
