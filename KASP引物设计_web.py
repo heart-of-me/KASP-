@@ -17,8 +17,10 @@ from dataclasses import dataclass
 try:
     import primer3
     PRIMER3_AVAILABLE = True
+    PRIMER3_VERSION = getattr(primer3, '__version__', 'unknown')
 except ImportError:
     PRIMER3_AVAILABLE = False
+    PRIMER3_VERSION = None
 
 # ==================== 页面配置 ====================
 st.set_page_config(
@@ -28,9 +30,19 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# 显示Primer3状态
-if not PRIMER3_AVAILABLE:
-    st.sidebar.warning("⚠️ primer3-py未安装，使用内置算法")
+# 显示Primer3状态 (在侧边栏底部)
+def show_primer3_status():
+    """显示Primer3库状态"""
+    if PRIMER3_AVAILABLE:
+        st.sidebar.success(f"✅ Primer3-py v{PRIMER3_VERSION} 已加载")
+    else:
+        st.sidebar.error("""⚠️ primer3-py未安装
+        
+请运行以下命令安装：
+```bash
+pip install primer3-py
+```
+当前使用内置算法（精度较低）""")
 
 # ==================== 自定义样式 ====================
 st.markdown("""
@@ -3110,6 +3122,11 @@ def main():
     )
     
     st.sidebar.markdown("---")
+    
+    # 显示Primer3状态
+    show_primer3_status()
+    
+    st.sidebar.markdown("---")
     st.sidebar.markdown("""
     <small>
     
@@ -3117,11 +3134,11 @@ def main():
     
     本工具用于设计KASP基因分型引物和常规PCR引物。
     
-    支持功能:
-    - KASP引物多方案设计
-    - 常规PCR引物对设计
-    - 引物质量综合评估
-    - CSV报告导出
+    **核心算法: Primer3-py**
+    - Tm计算 (SantaLucia法)
+    - 发夹结构检测
+    - 二聚体风险评估
+    - 专业引物设计引擎
     
     </small>
     """, unsafe_allow_html=True)
@@ -3129,7 +3146,13 @@ def main():
     # 页面路由
     if page == "🏠 首页":
         st.markdown('<p class="main-header">🧬 引物设计工具</p>', unsafe_allow_html=True)
-        st.markdown('<p class="sub-header">KASP & 常规PCR 引物设计平台 v5.0</p>', unsafe_allow_html=True)
+        st.markdown('<p class="sub-header">KASP & 常规PCR 引物设计平台 v6.0 (Primer3-py)</p>', unsafe_allow_html=True)
+        
+        # 显示Primer3状态卡片
+        if PRIMER3_AVAILABLE:
+            st.success(f"🔬 **Primer3-py v{PRIMER3_VERSION}** 已加载 - 使用专业热力学算法")
+        else:
+            st.warning("⚠️ Primer3-py未安装，正在使用内置算法。建议运行 `pip install primer3-py` 获得更精确的计算结果。")
         
         st.markdown("---")
         
