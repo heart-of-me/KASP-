@@ -1,0 +1,10 @@
+# KASP引物设计工具 - 依赖项
+# Streamlit Web框架
+streamlit>=1.28.0
+
+# Primer3 热力学计算库 (核心依赖)
+primer3-py>=2.0.0
+
+# 可选：如果需要数据处理
+# pandas>=1.5.0
+# numpy>=1.24.0
