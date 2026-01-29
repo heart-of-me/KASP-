@@ -1,7 +1,8 @@
 """
 KASP & 常规PCR 引物设计工具 - Streamlit Web版
-版本: v5.0 Web
+版本: v6.0 Web (Primer3-py重构版)
 功能: KASP引物设计、常规PCR引物设计、质量评估、CSV导出
+重构: 使用primer3-py库进行专业的热力学计算，参考polyoligo-kasp设计理念
 """
 
 import streamlit as st
@@ -9,16 +10,27 @@ import re
 import csv
 import io
 from datetime import datetime
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 from dataclasses import dataclass
+
+# 尝试导入primer3库
+try:
+    import primer3
+    PRIMER3_AVAILABLE = True
+except ImportError:
+    PRIMER3_AVAILABLE = False
 
 # ==================== 页面配置 ====================
 st.set_page_config(
-    page_title="引物设计工具 v5.0",
+    page_title="引物设计工具 v6.0",
     page_icon="🧬",
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# 显示Primer3状态
+if not PRIMER3_AVAILABLE:
+    st.sidebar.warning("⚠️ primer3-py未安装，使用内置算法")
 
 # ==================== 自定义样式 ====================
 st.markdown("""
@@ -130,7 +142,30 @@ class RegularPCRConfig:
     WHEAT_MIN_UNIQUE_BASES: int = 3  # 3'端最少独特碱基数
 
 
-# ==================== 核心计算函数 ====================
+# ==================== Primer3 热力学参数配置 ====================
+
+@dataclass
+class Primer3ThermoParams:
+    """Primer3热力学计算参数 - 参考polyoligo-kasp"""
+    mv_conc: float = 50.0      # 单价阳离子浓度 (mM)
+    dv_conc: float = 1.5       # 二价阳离子浓度 (mM)
+    dntp_conc: float = 0.6     # dNTP浓度 (mM)
+    dna_conc: float = 250.0    # DNA/引物浓度 (nM)
+    temp_c: float = 37.0       # 模拟温度 (°C)
+    max_loop: int = 30         # 最大环大小
+    
+    # KASP特定参数
+    kasp_mv_conc: float = 50.0
+    kasp_dv_conc: float = 2.0   # KASP通常使用更高的Mg2+
+    kasp_dntp_conc: float = 0.8
+    kasp_dna_conc: float = 200.0
+
+
+# 全局热力学参数实例
+THERMO_PARAMS = Primer3ThermoParams()
+
+
+# ==================== 核心计算函数 (Primer3-py重构) ====================
 
 def calc_gc_content(seq: str) -> float:
     """计算GC含量百分比"""
@@ -139,53 +174,73 @@ def calc_gc_content(seq: str) -> float:
     return (gc / len(seq)) * 100 if len(seq) > 0 else 0
 
 
-def calc_tm_nearest_neighbor(seq: str, na_conc: float = 50.0, primer_conc: float = 250.0) -> float:
+def calc_tm(seq: str, mv_conc: float = 50.0, dv_conc: float = 1.5, 
+            dntp_conc: float = 0.6, dna_conc: float = 250.0) -> float:
     """
-    使用最近邻法(Nearest-Neighbor)计算Tm值
-    这是目前最准确的Tm计算方法，与实际实验值偏差通常<2°C
+    使用Primer3计算Tm值 (SantaLucia方法)
     
     参数:
         seq: 引物序列
-        na_conc: Na+浓度 (mM)，默认50mM
-        primer_conc: 引物浓度 (nM)，默认250nM
+        mv_conc: 单价阳离子浓度 (mM)
+        dv_conc: 二价阳离子浓度 (mM)  
+        dntp_conc: dNTP浓度 (mM)
+        dna_conc: DNA浓度 (nM)
     
-    参考: SantaLucia J Jr. (1998) PNAS 95:1460-1465
+    返回:
+        Tm值 (°C)
     """
     seq = seq.upper()
-    length = len(seq)
+    seq = re.sub(r'[^ATGC]', '', seq)  # 清除非标准碱基
     
-    if length < 8:
-        # 序列过短，使用简单公式
+    if len(seq) < 5:
+        # 序列过短，使用简单Wallace公式
         gc_count = seq.count('G') + seq.count('C')
         at_count = seq.count('A') + seq.count('T')
         return round(2 * at_count + 4 * gc_count, 1)
     
-    # 最近邻热力学参数 (ΔH kcal/mol, ΔS cal/mol·K)
+    if PRIMER3_AVAILABLE:
+        try:
+            tm = primer3.calc_tm(
+                seq,
+                mv_conc=mv_conc,
+                dv_conc=dv_conc,
+                dntp_conc=dntp_conc,
+                dna_conc=dna_conc,
+                tm_method='santalucia',
+                salt_corrections_method='santalucia'
+            )
+            return round(tm, 1)
+        except Exception:
+            pass
+    
+    # 回退到内置最近邻算法
+    return _calc_tm_fallback(seq, mv_conc, dv_conc, dna_conc)
+
+
+def _calc_tm_fallback(seq: str, na_conc: float = 50.0, 
+                      mg_conc: float = 1.5, primer_conc: float = 250.0) -> float:
+    """内置最近邻法Tm计算(回退方案)"""
+    import math
+    seq = seq.upper()
+    length = len(seq)
+    
     # SantaLucia 1998 统一参数
     nn_params = {
         'AA': (-7.9, -22.2), 'TT': (-7.9, -22.2),
-        'AT': (-7.2, -20.4),
-        'TA': (-7.2, -21.3),
+        'AT': (-7.2, -20.4), 'TA': (-7.2, -21.3),
         'CA': (-8.5, -22.7), 'TG': (-8.5, -22.7),
         'GT': (-8.4, -22.4), 'AC': (-8.4, -22.4),
         'CT': (-7.8, -21.0), 'AG': (-7.8, -21.0),
         'GA': (-8.2, -22.2), 'TC': (-8.2, -22.2),
-        'CG': (-10.6, -27.2),
-        'GC': (-9.8, -24.4),
+        'CG': (-10.6, -27.2), 'GC': (-9.8, -24.4),
         'GG': (-8.0, -19.9), 'CC': (-8.0, -19.9),
     }
-    
-    # 起始参数
     init_params = {
         'G': (0.1, -2.8), 'C': (0.1, -2.8),
         'A': (2.3, 4.1), 'T': (2.3, 4.1)
     }
     
-    # 计算ΔH和ΔS
-    dH = 0.0  # kcal/mol
-    dS = 0.0  # cal/mol·K
-    
-    # 起始贡献
+    dH, dS = 0.0, 0.0
     if seq[0] in init_params:
         dH += init_params[seq[0]][0]
         dS += init_params[seq[0]][1]
@@ -193,61 +248,78 @@ def calc_tm_nearest_neighbor(seq: str, na_conc: float = 50.0, primer_conc: float
         dH += init_params[seq[-1]][0]
         dS += init_params[seq[-1]][1]
     
-    # 最近邻贡献
     for i in range(length - 1):
         dinuc = seq[i:i+2]
         if dinuc in nn_params:
             dH += nn_params[dinuc][0]
             dS += nn_params[dinuc][1]
     
-    # 盐浓度校正 (von Ahsen 2001)
-    # ΔS_corrected = ΔS + 0.368 * N * ln([Na+])
-    import math
-    na_molar = na_conc / 1000.0  # 转换为M
+    na_equiv = na_conc + 120 * math.sqrt(mg_conc)
+    na_molar = na_equiv / 1000.0
     dS_corrected = dS + 0.368 * (length - 1) * math.log(na_molar)
     
-    # 计算Tm
-    # Tm = ΔH / (ΔS + R * ln(Ct/4)) - 273.15
-    # R = 1.987 cal/mol·K
     R = 1.987
-    ct = primer_conc * 1e-9  # 转换为M
-    
+    ct = primer_conc * 1e-9
     tm = (dH * 1000) / (dS_corrected + R * math.log(ct / 4)) - 273.15
     
     return round(tm, 1)
 
 
-def calc_tm_simple(seq: str) -> float:
-    """
-    使用改进的Wallace公式计算Tm值（用于快速筛选）
-    适用于14-30bp的引物
-    """
-    seq = seq.upper()
-    length = len(seq)
-    gc_count = seq.count('G') + seq.count('C')
-    
-    if length < 14:
-        # Wallace公式
-        tm = 2 * (length - gc_count) + 4 * gc_count
-    else:
-        # 改进的公式，考虑长度影响
-        gc_percent = (gc_count / length) * 100
-        # Primer3使用的公式变体
-        tm = 64.9 + 41 * (gc_count - 16.4) / length
-    
-    return round(tm, 1)
+# 保留旧函数名以兼容
+calc_tm_nearest_neighbor = calc_tm
+calc_tm_simple = lambda seq: calc_tm(seq)
 
 
 def reverse_complement(seq: str) -> str:
     """生成反向互补序列"""
+    if PRIMER3_AVAILABLE:
+        try:
+            from primer3 import p3helpers
+            return p3helpers.reverse_complement(seq.upper())
+        except Exception:
+            pass
+    
     complement = {'A': 'T', 'T': 'A', 'G': 'C', 'C': 'G',
                   'a': 't', 't': 'a', 'g': 'c', 'c': 'g',
                   'N': 'N', 'n': 'n'}
     return ''.join(complement.get(base, base) for base in reversed(seq))
 
 
-def check_hairpin(seq: str, min_stem: int = 4, min_loop: int = 3) -> bool:
-    """检测发夹结构"""
+def check_hairpin(seq: str, min_stem: int = 4, min_loop: int = 3) -> Tuple[bool, Optional[float]]:
+    """
+    使用Primer3检测发夹结构
+    
+    返回: (是否有发夹, 发夹Tm值)
+    """
+    seq = seq.upper()
+    seq = re.sub(r'[^ATGC]', '', seq)
+    
+    if len(seq) < 10:
+        return False, None
+    
+    if PRIMER3_AVAILABLE:
+        try:
+            result = primer3.calc_hairpin(
+                seq,
+                mv_conc=THERMO_PARAMS.mv_conc,
+                dv_conc=THERMO_PARAMS.dv_conc,
+                dntp_conc=THERMO_PARAMS.dntp_conc,
+                dna_conc=THERMO_PARAMS.dna_conc,
+                temp_c=THERMO_PARAMS.temp_c,
+                max_loop=THERMO_PARAMS.max_loop
+            )
+            # 发夹Tm > 45°C 或 dG < -2 kcal/mol 认为有问题
+            has_hairpin = result.structure_found and (result.tm > 45 or result.dg < -2000)
+            return has_hairpin, result.tm if result.structure_found else None
+        except Exception:
+            pass
+    
+    # 回退到简单检测
+    return _check_hairpin_fallback(seq, min_stem, min_loop), None
+
+
+def _check_hairpin_fallback(seq: str, min_stem: int = 4, min_loop: int = 3) -> bool:
+    """内置发夹检测(回退方案)"""
     seq = seq.upper()
     length = len(seq)
     
@@ -258,13 +330,54 @@ def check_hairpin(seq: str, min_stem: int = 4, min_loop: int = 3) -> bool:
                 j = i + stem_len + loop_len
                 if j + stem_len <= length:
                     stem2 = seq[j:j + stem_len]
-                    if stem1 == reverse_complement(stem2)[::-1]:
+                    rc_stem2 = reverse_complement(stem2)[::-1]
+                    if stem1 == rc_stem2:
                         return True
     return False
 
 
+def check_homodimer(seq: str) -> Tuple[bool, Optional[float], Optional[float]]:
+    """
+    使用Primer3检测自身二聚体(同源二聚体)
+    
+    返回: (是否有二聚体风险, dG值, Tm值)
+    """
+    seq = seq.upper()
+    seq = re.sub(r'[^ATGC]', '', seq)
+    
+    if len(seq) < 10:
+        return False, None, None
+    
+    if PRIMER3_AVAILABLE:
+        try:
+            result = primer3.calc_homodimer(
+                seq,
+                mv_conc=THERMO_PARAMS.mv_conc,
+                dv_conc=THERMO_PARAMS.dv_conc,
+                dntp_conc=THERMO_PARAMS.dntp_conc,
+                dna_conc=THERMO_PARAMS.dna_conc,
+                temp_c=THERMO_PARAMS.temp_c,
+                max_loop=THERMO_PARAMS.max_loop
+            )
+            # dG < -9 kcal/mol 或 Tm > 40°C 认为有风险
+            has_dimer = result.structure_found and (result.dg < -9000 or result.tm > 40)
+            return has_dimer, result.dg / 1000 if result.structure_found else None, result.tm if result.structure_found else None
+        except Exception:
+            pass
+    
+    # 回退到简单检测
+    return _check_self_dimer_fallback(seq), None, None
+
+
+# 保持兼容性的别名
 def check_self_dimer(seq: str, min_complementary: int = 4) -> bool:
-    """检测自身二聚体"""
+    """检测自身二聚体 (兼容旧接口)"""
+    has_dimer, _, _ = check_homodimer(seq)
+    return has_dimer
+
+
+def _check_self_dimer_fallback(seq: str, min_complementary: int = 4) -> bool:
+    """内置自身二聚体检测(回退方案)"""
     seq = seq.upper()
     rc = reverse_complement(seq)
     length = len(seq)
@@ -281,8 +394,50 @@ def check_self_dimer(seq: str, min_complementary: int = 4) -> bool:
     return False
 
 
+def check_heterodimer(seq1: str, seq2: str) -> Tuple[bool, Optional[float], Optional[float]]:
+    """
+    使用Primer3检测引物间二聚体(异源二聚体)
+    
+    返回: (是否有二聚体风险, dG值, Tm值)
+    """
+    seq1 = seq1.upper()
+    seq2 = seq2.upper()
+    seq1 = re.sub(r'[^ATGC]', '', seq1)
+    seq2 = re.sub(r'[^ATGC]', '', seq2)
+    
+    if len(seq1) < 10 or len(seq2) < 10:
+        return False, None, None
+    
+    if PRIMER3_AVAILABLE:
+        try:
+            result = primer3.calc_heterodimer(
+                seq1, seq2,
+                mv_conc=THERMO_PARAMS.mv_conc,
+                dv_conc=THERMO_PARAMS.dv_conc,
+                dntp_conc=THERMO_PARAMS.dntp_conc,
+                dna_conc=THERMO_PARAMS.dna_conc,
+                temp_c=THERMO_PARAMS.temp_c,
+                max_loop=THERMO_PARAMS.max_loop
+            )
+            # dG < -9 kcal/mol 或 Tm > 40°C 认为有风险
+            has_dimer = result.structure_found and (result.dg < -9000 or result.tm > 40)
+            return has_dimer, result.dg / 1000 if result.structure_found else None, result.tm if result.structure_found else None
+        except Exception:
+            pass
+    
+    # 回退到简单检测
+    return _check_primer_dimer_fallback(seq1, seq2), None, None
+
+
+# 保持兼容性的别名
 def check_primer_dimer(seq1: str, seq2: str, min_complementary: int = 4) -> bool:
-    """检测引物二聚体"""
+    """检测引物二聚体 (兼容旧接口)"""
+    has_dimer, _, _ = check_heterodimer(seq1, seq2)
+    return has_dimer
+
+
+def _check_primer_dimer_fallback(seq1: str, seq2: str, min_complementary: int = 4) -> bool:
+    """内置引物二聚体检测(回退方案)"""
     seq1 = seq1.upper()
     seq2 = seq2.upper()
     rc2 = reverse_complement(seq2)
@@ -299,6 +454,33 @@ def check_primer_dimer(seq1: str, seq2: str, min_complementary: int = 4) -> bool
             return True
     
     return False
+
+
+def check_end_stability(seq1: str, seq2: str) -> Tuple[bool, Optional[float]]:
+    """
+    使用Primer3检测3'端稳定性
+    
+    返回: (是否稳定, dG值)
+    """
+    seq1 = seq1.upper()
+    seq2 = seq2.upper()
+    
+    if PRIMER3_AVAILABLE:
+        try:
+            result = primer3.calc_end_stability(
+                seq1, seq2,
+                mv_conc=THERMO_PARAMS.mv_conc,
+                dv_conc=THERMO_PARAMS.dv_conc,
+                dntp_conc=THERMO_PARAMS.dntp_conc,
+                dna_conc=THERMO_PARAMS.dna_conc
+            )
+            # dG值越负，稳定性越好；但过于稳定可能导致非特异性
+            is_good = -10000 < result.dg < -3000  # -10 to -3 kcal/mol
+            return is_good, result.dg / 1000
+        except Exception:
+            pass
+    
+    return True, None
 
 
 def check_3prime_stability(seq: str) -> Tuple[bool, str]:
@@ -331,13 +513,29 @@ def evaluate_primer_quality(seq: str, config=None) -> Dict:
         config = KASPConfig()
     
     seq = seq.upper()
+    seq = re.sub(r'[^ATGC]', '', seq)
+    
+    # 使用Primer3进行热力学分析
+    tm_value = calc_tm(seq)
+    hairpin_result = check_hairpin(seq)
+    homodimer_result = check_homodimer(seq)
+    
+    # 处理返回值 (新API返回元组)
+    has_hairpin = hairpin_result[0] if isinstance(hairpin_result, tuple) else hairpin_result
+    hairpin_tm = hairpin_result[1] if isinstance(hairpin_result, tuple) and len(hairpin_result) > 1 else None
+    
+    has_self_dimer = homodimer_result[0] if isinstance(homodimer_result, tuple) else homodimer_result
+    homodimer_dg = homodimer_result[1] if isinstance(homodimer_result, tuple) and len(homodimer_result) > 1 else None
+    
     result = {
         'sequence': seq,
         'length': len(seq),
         'gc_content': calc_gc_content(seq),
-        'tm': calc_tm_nearest_neighbor(seq),
-        'has_hairpin': check_hairpin(seq),
-        'has_self_dimer': check_self_dimer(seq),
+        'tm': tm_value,
+        'has_hairpin': has_hairpin,
+        'hairpin_tm': hairpin_tm,
+        'has_self_dimer': has_self_dimer,
+        'homodimer_dg': homodimer_dg,
         'three_prime_ok': check_3prime_stability(seq)[0],
         'three_prime_msg': check_3prime_stability(seq)[1],
         'issues': [],
@@ -641,10 +839,126 @@ def parse_snp_sequence(seq_with_snp: str) -> Tuple[str, str, str, str]:
     return upstream, downstream, allele1, allele2
 
 
+def design_kasp_common_primer_with_primer3(downstream: str, config: KASPConfig,
+                                            min_distance: int = 30, max_distance: int = 80) -> List[Dict]:
+    """
+    使用Primer3设计KASP通用反向引物 - 参考polyoligo-kasp
+    
+    参数:
+        downstream: SNP下游序列
+        config: KASP配置
+        min_distance: 距SNP最小距离
+        max_distance: 距SNP最大距离
+    
+    返回:
+        反向引物候选列表
+    """
+    if not PRIMER3_AVAILABLE:
+        return []
+    
+    if len(downstream) < max_distance + config.MIN_PRIMER_LEN:
+        max_distance = len(downstream) - config.MIN_PRIMER_LEN
+    
+    if max_distance < min_distance:
+        return []
+    
+    candidates = []
+    
+    # 使用Primer3的设计引擎只设计右引物
+    seq_args = {
+        'SEQUENCE_ID': 'kasp_common',
+        'SEQUENCE_TEMPLATE': downstream,
+        'SEQUENCE_FORCE_LEFT_START': 0,  # 强制从0开始（但我们不用左引物）
+    }
+    
+    global_args = {
+        'PRIMER_TASK': 'pick_primer_list',  # 只选择引物，不配对
+        'PRIMER_PICK_LEFT_PRIMER': 0,
+        'PRIMER_PICK_RIGHT_PRIMER': 1,
+        'PRIMER_PICK_INTERNAL_OLIGO': 0,
+        'PRIMER_NUM_RETURN': 20,
+        
+        'PRIMER_MIN_SIZE': config.MIN_PRIMER_LEN,
+        'PRIMER_OPT_SIZE': config.OPTIMAL_PRIMER_LEN,
+        'PRIMER_MAX_SIZE': config.MAX_PRIMER_LEN,
+        
+        'PRIMER_MIN_TM': config.MIN_TM,
+        'PRIMER_OPT_TM': config.OPTIMAL_TM,
+        'PRIMER_MAX_TM': config.MAX_TM,
+        
+        'PRIMER_MIN_GC': config.MIN_GC,
+        'PRIMER_MAX_GC': config.MAX_GC,
+        
+        'PRIMER_SALT_MONOVALENT': THERMO_PARAMS.kasp_mv_conc,
+        'PRIMER_SALT_DIVALENT': THERMO_PARAMS.kasp_dv_conc,
+        'PRIMER_DNTP_CONC': THERMO_PARAMS.kasp_dntp_conc,
+        'PRIMER_DNA_CONC': THERMO_PARAMS.kasp_dna_conc,
+        
+        'PRIMER_MAX_SELF_ANY': 8,
+        'PRIMER_MAX_SELF_END': 3,
+        'PRIMER_MAX_HAIRPIN_TH': 47.0,
+        'PRIMER_MAX_POLY_X': 4,
+        'PRIMER_GC_CLAMP': 1,
+        
+        'PRIMER_PRODUCT_SIZE_RANGE': [[min_distance + config.MIN_PRIMER_LEN, 
+                                       max_distance + config.MAX_PRIMER_LEN]],
+    }
+    
+    try:
+        results = primer3.design_primers(seq_args, global_args)
+        num_returned = results.get('PRIMER_RIGHT_NUM_RETURNED', 0)
+        
+        for i in range(num_returned):
+            try:
+                seq = results.get(f'PRIMER_RIGHT_{i}_SEQUENCE', '')
+                pos = results.get(f'PRIMER_RIGHT_{i}', [0, 0])
+                tm = results.get(f'PRIMER_RIGHT_{i}_TM', 0)
+                gc = results.get(f'PRIMER_RIGHT_{i}_GC_PERCENT', 0)
+                
+                if not seq:
+                    continue
+                
+                # 计算距离SNP的距离
+                rev_distance = pos[0] - pos[1] + 1
+                
+                # 检查距离是否在范围内
+                if rev_distance < min_distance or rev_distance > max_distance:
+                    continue
+                
+                # 检测二级结构
+                has_hairpin, hairpin_tm = check_hairpin(seq)
+                has_dimer, dimer_dg, _ = check_homodimer(seq)
+                
+                candidate = {
+                    'sequence': seq,
+                    'position': pos,
+                    'distance': rev_distance,
+                    'tm': round(tm, 1),
+                    'gc': round(gc, 1),
+                    'has_hairpin': has_hairpin,
+                    'hairpin_tm': hairpin_tm,
+                    'has_dimer': has_dimer,
+                    'dimer_dg': dimer_dg,
+                    'penalty': results.get(f'PRIMER_RIGHT_{i}_PENALTY', 0)
+                }
+                candidates.append(candidate)
+                
+            except Exception:
+                continue
+        
+        # 按penalty排序
+        candidates.sort(key=lambda x: x['penalty'])
+        
+    except Exception:
+        pass
+    
+    return candidates
+
+
 def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, allele2: str, 
                               config: KASPConfig = None, num_schemes: int = 5) -> List[Dict]:
     """
-    设计多套KASP引物方案 - 优化版
+    设计多套KASP引物方案 - 优化版 (支持Primer3)
     确保不产生重复引物，质量不达标时返回空列表
     """
     if config is None:
@@ -658,6 +972,15 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
         return []  # 下游序列太短
     
     all_schemes = []
+    
+    # === 使用Primer3预先设计Common引物候选 ===
+    primer3_common_candidates = []
+    if PRIMER3_AVAILABLE:
+        primer3_common_candidates = design_kasp_common_primer_with_primer3(
+            downstream, config,
+            min_distance=config.REV_MIN_DISTANCE,
+            max_distance=config.REV_MAX_DISTANCE
+        )
     
     # 生成不同长度的正向引物
     for primer_len in range(config.MIN_PRIMER_LEN, min(config.MAX_PRIMER_LEN + 1, len(upstream) + 1)):
@@ -706,6 +1029,103 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
                 continue
             
             # 搜索反向引物
+            # === 优先使用Primer3设计的Common引物 ===
+            if primer3_common_candidates:
+                for common_cand in primer3_common_candidates[:10]:  # 最多使用前10个候选
+                    rev_seq = common_cand['sequence']
+                    rev_dist = common_cand['distance']
+                    
+                    eval_rev = evaluate_primer_quality(rev_seq, config)
+                    
+                    if eval_rev['score'] < 40:
+                        continue
+                    
+                    # 检查引物二聚体 (使用Primer3的检测)
+                    has_dimer_1, dimer_dg_1, _ = check_heterodimer(fwd_allele1, rev_seq)
+                    has_dimer_2, dimer_dg_2, _ = check_heterodimer(fwd_allele2, rev_seq)
+                    has_dimer = has_dimer_1 or has_dimer_2
+                    
+                    product_size = len(upstream) + 1 + rev_dist + len(rev_seq)
+                    
+                    # 基础评分
+                    avg_fwd_score = (eval1['score'] + eval2['score']) / 2
+                    total_score = (avg_fwd_score * 0.4 + eval_rev['score'] * 0.3)
+                    
+                    # Tm匹配评分
+                    if tm_diff <= 0.5:
+                        total_score += 15
+                    elif tm_diff <= 1.0:
+                        total_score += 10
+                    elif tm_diff <= 2.0:
+                        total_score += 5
+                    else:
+                        total_score -= 10
+                    
+                    if has_dimer:
+                        total_score -= 15
+                    
+                    # 额外加分：来自Primer3的优化引物
+                    total_score += 5
+                    
+                    wheat_issues = []
+                    wheat_details = {}
+                    
+                    if config.WHEAT_MODE:
+                        wheat_bonus, wheat_issues, wheat_details = evaluate_kasp_wheat_specificity(
+                            upstream, downstream, fwd_allele1, rev_seq, config
+                        )
+                        total_score += wheat_bonus
+                        amplicon_status, amplicon_bonus = check_amplicon_length_kasp(product_size)
+                        total_score += amplicon_bonus
+                        wheat_details['amplicon_status'] = amplicon_status
+                    
+                    total_score = max(0, min(100, total_score))
+                    
+                    is_usable = True
+                    if config.WHEAT_MODE:
+                        is_usable = (
+                            total_score >= 50 and
+                            product_size <= 120 and
+                            30 <= eval1['gc_content'] <= 65 and
+                            30 <= eval_rev['gc_content'] <= 65 and
+                            not has_dimer and
+                            tm_diff <= config.MAX_TM_DIFF
+                        )
+                    else:
+                        is_usable = (
+                            total_score >= 45 and
+                            not has_dimer and
+                            tm_diff <= config.MAX_TM_DIFF
+                        )
+                    
+                    scheme = {
+                        'fwd_allele1_full': fwd_with_fam,
+                        'fwd_allele2_full': fwd_with_hex,
+                        'fwd_allele1_core': fwd_allele1,
+                        'fwd_allele2_core': fwd_allele2,
+                        'reverse': rev_seq,
+                        'allele1': allele1,
+                        'allele2': allele2,
+                        'mismatch_pos': mismatch_pos,
+                        'mismatch_change': f"{original_base}→{mismatch_base}",
+                        'eval_fwd1': eval1,
+                        'eval_fwd2': eval2,
+                        'eval_rev': eval_rev,
+                        'tm_diff': tm_diff,
+                        'has_dimer': has_dimer,
+                        'heterodimer_dg': min(dimer_dg_1 or 0, dimer_dg_2 or 0) if (dimer_dg_1 or dimer_dg_2) else None,
+                        'product_size': product_size,
+                        'rev_distance': rev_dist,
+                        'total_score': total_score,
+                        'is_usable': is_usable,
+                        'wheat_mode': config.WHEAT_MODE,
+                        'wheat_issues': wheat_issues,
+                        'wheat_details': wheat_details,
+                        'primer3_designed': True
+                    }
+                    all_schemes.append(scheme)
+            
+            # === 回退：手动搜索反向引物 ===
             max_rev_dist = min(config.REV_MAX_DISTANCE + 1, len(downstream) - config.MIN_PRIMER_LEN + 1)
             if max_rev_dist <= config.REV_MIN_DISTANCE:
                 continue
@@ -996,13 +1416,23 @@ def check_gc_clamp(seq: str) -> Tuple[bool, str]:
 
 
 def evaluate_primer_quality_strict(seq: str, config) -> Dict:
-    """严格评估引物质量（用于常规PCR）"""
+    """严格评估引物质量（用于常规PCR）- 使用Primer3热力学分析"""
     seq = seq.upper()
+    seq = re.sub(r'[^ATGC]', '', seq)
     
     gc_content = calc_gc_content(seq)
-    tm = calc_tm_nearest_neighbor(seq)
-    has_hairpin = check_hairpin(seq)
-    has_self_dimer = check_self_dimer(seq)
+    tm = calc_tm(seq)
+    
+    # 使用Primer3进行结构分析
+    hairpin_result = check_hairpin(seq)
+    homodimer_result = check_homodimer(seq)
+    
+    has_hairpin = hairpin_result[0] if isinstance(hairpin_result, tuple) else hairpin_result
+    hairpin_tm = hairpin_result[1] if isinstance(hairpin_result, tuple) and len(hairpin_result) > 1 else None
+    
+    has_self_dimer = homodimer_result[0] if isinstance(homodimer_result, tuple) else homodimer_result
+    homodimer_dg = homodimer_result[1] if isinstance(homodimer_result, tuple) and len(homodimer_result) > 1 else None
+    
     three_prime_ok, three_prime_msg = check_gc_clamp(seq)
     has_repeat = check_repeat_region(seq)
     
@@ -1012,7 +1442,9 @@ def evaluate_primer_quality_strict(seq: str, config) -> Dict:
         'gc_content': gc_content,
         'tm': tm,
         'has_hairpin': has_hairpin,
+        'hairpin_tm': hairpin_tm,
         'has_self_dimer': has_self_dimer,
+        'homodimer_dg': homodimer_dg,
         'has_repeat': has_repeat,
         'three_prime_ok': three_prime_ok,
         'three_prime_msg': three_prime_msg,
@@ -1081,11 +1513,245 @@ def evaluate_primer_quality_strict(seq: str, config) -> Dict:
     return result
 
 
+# ==================== 基于Primer3的引物设计 (polyoligo-kasp风格) ====================
+
+def design_primers_with_primer3(sequence: str, config: RegularPCRConfig = None,
+                                  num_pairs: int = 5, target_region: Tuple[int, int] = None) -> List[Dict]:
+    """
+    使用Primer3库进行专业的引物设计 - 参考polyoligo-kasp设计理念
+    
+    参数:
+        sequence: 模板序列
+        config: PCR配置参数
+        num_pairs: 需要返回的引物对数量
+        target_region: 目标区域 (start, length)
+    
+    返回:
+        引物对列表
+    """
+    if not PRIMER3_AVAILABLE:
+        return []  # 回退到手动设计
+    
+    if config is None:
+        config = RegularPCRConfig()
+    
+    sequence = re.sub(r'[^ATGC]', '', sequence.upper())
+    seq_len = len(sequence)
+    
+    if seq_len < config.PRODUCT_MIN + 40:
+        return []
+    
+    # 构建Primer3序列参数
+    seq_args = {
+        'SEQUENCE_ID': 'target',
+        'SEQUENCE_TEMPLATE': sequence,
+    }
+    
+    # 设置目标区域
+    if target_region:
+        seq_args['SEQUENCE_TARGET'] = [target_region[0], target_region[1]]
+    else:
+        # 默认目标区域为序列中间
+        margin = max(50, config.MIN_PRIMER_LEN + 10)
+        target_start = margin
+        target_len = seq_len - 2 * margin
+        if target_len > 0:
+            seq_args['SEQUENCE_INCLUDED_REGION'] = [target_start, target_len]
+    
+    # 构建Primer3全局参数 - 参考polyoligo-kasp
+    global_args = {
+        'PRIMER_TASK': 'generic',
+        'PRIMER_PICK_LEFT_PRIMER': 1,
+        'PRIMER_PICK_RIGHT_PRIMER': 1,
+        'PRIMER_PICK_INTERNAL_OLIGO': 0,
+        'PRIMER_NUM_RETURN': num_pairs * 2,  # 多返回一些以便筛选
+        
+        # 引物长度
+        'PRIMER_MIN_SIZE': config.MIN_PRIMER_LEN,
+        'PRIMER_OPT_SIZE': config.OPTIMAL_PRIMER_LEN,
+        'PRIMER_MAX_SIZE': config.MAX_PRIMER_LEN,
+        
+        # Tm参数
+        'PRIMER_MIN_TM': config.MIN_TM,
+        'PRIMER_OPT_TM': config.OPTIMAL_TM,
+        'PRIMER_MAX_TM': config.MAX_TM,
+        'PRIMER_PAIR_MAX_DIFF_TM': config.MAX_TM_DIFF,
+        
+        # GC含量
+        'PRIMER_MIN_GC': config.MIN_GC,
+        'PRIMER_MAX_GC': config.MAX_GC,
+        
+        # 产物大小范围
+        'PRIMER_PRODUCT_SIZE_RANGE': [[config.PRODUCT_MIN, config.PRODUCT_MAX]],
+        
+        # 热力学参数
+        'PRIMER_SALT_MONOVALENT': THERMO_PARAMS.mv_conc,
+        'PRIMER_SALT_DIVALENT': THERMO_PARAMS.dv_conc,
+        'PRIMER_DNTP_CONC': THERMO_PARAMS.dntp_conc,
+        'PRIMER_DNA_CONC': THERMO_PARAMS.dna_conc,
+        
+        # 二级结构和二聚体检测阈值
+        'PRIMER_MAX_SELF_ANY': 8,
+        'PRIMER_MAX_SELF_END': 3,
+        'PRIMER_PAIR_MAX_COMPL_ANY': 8,
+        'PRIMER_PAIR_MAX_COMPL_END': 3,
+        'PRIMER_MAX_HAIRPIN_TH': 47.0,
+        
+        # 其他约束
+        'PRIMER_MAX_POLY_X': 4,  # 最多4个连续相同碱基
+        'PRIMER_MAX_NS_ACCEPTED': 0,
+        'PRIMER_GC_CLAMP': 1,  # 3'端至少1个GC
+        
+        # Tm计算方法
+        'PRIMER_TM_FORMULA': 1,  # SantaLucia
+        'PRIMER_SALT_CORRECTIONS': 1,  # SantaLucia
+    }
+    
+    try:
+        # 调用Primer3设计
+        results = primer3.design_primers(seq_args, global_args)
+        
+        # 解析结果
+        primer_pairs = []
+        num_returned = results.get('PRIMER_PAIR_NUM_RETURNED', 0)
+        
+        for i in range(min(num_returned, num_pairs)):
+            try:
+                # 提取引物信息
+                left_seq = results.get(f'PRIMER_LEFT_{i}_SEQUENCE', '')
+                right_seq = results.get(f'PRIMER_RIGHT_{i}_SEQUENCE', '')
+                
+                if not left_seq or not right_seq:
+                    continue
+                
+                left_pos = results.get(f'PRIMER_LEFT_{i}', [0, 0])
+                right_pos = results.get(f'PRIMER_RIGHT_{i}', [0, 0])
+                
+                left_tm = results.get(f'PRIMER_LEFT_{i}_TM', 0)
+                right_tm = results.get(f'PRIMER_RIGHT_{i}_TM', 0)
+                
+                left_gc = results.get(f'PRIMER_LEFT_{i}_GC_PERCENT', 0)
+                right_gc = results.get(f'PRIMER_RIGHT_{i}_GC_PERCENT', 0)
+                
+                product_size = results.get(f'PRIMER_PAIR_{i}_PRODUCT_SIZE', 0)
+                
+                # 检测二聚体
+                has_dimer, dimer_dg, dimer_tm = check_heterodimer(left_seq, right_seq)
+                
+                # 检测发夹
+                left_hairpin, left_hp_tm = check_hairpin(left_seq)
+                right_hairpin, right_hp_tm = check_hairpin(right_seq)
+                
+                # 检测自身二聚体
+                left_homo, left_homo_dg, _ = check_homodimer(left_seq)
+                right_homo, right_homo_dg, _ = check_homodimer(right_seq)
+                
+                # 构建评估结果
+                fwd_eval = {
+                    'sequence': left_seq,
+                    'length': len(left_seq),
+                    'tm': round(left_tm, 1),
+                    'gc_content': round(left_gc, 1),
+                    'has_hairpin': left_hairpin,
+                    'has_self_dimer': left_homo,
+                    'hairpin_tm': left_hp_tm,
+                    'homodimer_dg': left_homo_dg,
+                    'issues': [],
+                    'score': 100
+                }
+                
+                rev_eval = {
+                    'sequence': right_seq,
+                    'length': len(right_seq),
+                    'tm': round(right_tm, 1),
+                    'gc_content': round(right_gc, 1),
+                    'has_hairpin': right_hairpin,
+                    'has_self_dimer': right_homo,
+                    'hairpin_tm': right_hp_tm,
+                    'homodimer_dg': right_homo_dg,
+                    'issues': [],
+                    'score': 100
+                }
+                
+                # 评分调整
+                for eval_result in [fwd_eval, rev_eval]:
+                    if eval_result['has_hairpin']:
+                        eval_result['issues'].append('可能形成发夹结构')
+                        eval_result['score'] -= 10
+                    if eval_result['has_self_dimer']:
+                        eval_result['issues'].append('自身二聚体风险')
+                        eval_result['score'] -= 10
+                
+                # 计算综合评分
+                tm_diff = abs(left_tm - right_tm)
+                base_score = (fwd_eval['score'] + rev_eval['score']) / 2
+                
+                if tm_diff <= 0.5:
+                    base_score += 10
+                elif tm_diff <= 1.0:
+                    base_score += 5
+                elif tm_diff > 2.0:
+                    base_score -= 10
+                
+                if has_dimer:
+                    base_score -= 15
+                
+                # 产物大小评分
+                if 200 <= product_size <= 400:
+                    base_score += 5
+                
+                total_score = max(0, min(100, base_score))
+                
+                # 可用性判断
+                is_usable = (
+                    not has_dimer and
+                    tm_diff <= config.MAX_TM_DIFF and
+                    config.MIN_TM <= left_tm <= config.MAX_TM and
+                    config.MIN_TM <= right_tm <= config.MAX_TM
+                )
+                
+                pair = {
+                    'forward': left_seq,
+                    'reverse': right_seq,
+                    'fwd_start': left_pos[0] + 1,
+                    'fwd_end': left_pos[0] + left_pos[1],
+                    'rev_start': right_pos[0] - right_pos[1] + 2,
+                    'rev_end': right_pos[0] + 1,
+                    'fwd_eval': fwd_eval,
+                    'rev_eval': rev_eval,
+                    'tm_diff': round(tm_diff, 1),
+                    'has_dimer': has_dimer,
+                    'heterodimer_dg': dimer_dg,
+                    'product_size': product_size,
+                    'total_score': total_score,
+                    'is_usable': is_usable,
+                    'wheat_mode': config.WHEAT_MODE,
+                    'wheat_issues': [],
+                    'primer3_penalty': results.get(f'PRIMER_PAIR_{i}_PENALTY', 0),
+                    'fwd_position_percent': round(left_pos[0] / seq_len * 100, 1),
+                    'rev_position_percent': round(right_pos[0] / seq_len * 100, 1)
+                }
+                
+                primer_pairs.append(pair)
+                
+            except Exception:
+                continue
+        
+        # 按评分排序
+        primer_pairs.sort(key=lambda x: x['total_score'], reverse=True)
+        
+        return primer_pairs[:num_pairs]
+        
+    except Exception as e:
+        return []
+
+
 def design_regular_primers(sequence: str, config: RegularPCRConfig = None, 
                           num_pairs: int = 5, target_start: int = None, 
                           target_end: int = None) -> List[Dict]:
     """
     设计常规PCR引物对 - 优化版（支持小麦模式）
+    优先使用Primer3库，失败时回退到手动设计
     确保不产生重复引物对，质量不达标时返回空列表
     """
     if config is None:
@@ -1098,6 +1764,43 @@ def design_regular_primers(sequence: str, config: RegularPCRConfig = None,
     min_required_len = config.PRODUCT_MIN + 2 * config.MIN_PRIMER_LEN
     if seq_len < min_required_len:
         return []  # 序列太短，无法设计
+    
+    # === 优先尝试Primer3设计 (非小麦模式或小麦模式均可) ===
+    if PRIMER3_AVAILABLE:
+        target_region = None
+        if target_start is not None and target_end is not None:
+            target_len = target_end - target_start
+            if target_len > 10:
+                target_region = (target_start, target_len)
+        
+        primer3_results = design_primers_with_primer3(
+            sequence, config, num_pairs, target_region
+        )
+        
+        # 如果Primer3返回了足够的结果，进行小麦特异性评估后返回
+        if primer3_results and len(primer3_results) >= max(1, num_pairs // 2):
+            # 对小麦模式进行额外评估
+            if config.WHEAT_MODE:
+                for pair in primer3_results:
+                    fwd_position = pair['fwd_start'] / seq_len
+                    rev_position = pair['rev_end'] / seq_len
+                    
+                    fwd_bonus, fwd_issues = check_wheat_specificity(pair['forward'], fwd_position)
+                    rev_bonus, rev_issues = check_wheat_specificity(pair['reverse'], rev_position)
+                    
+                    pair['wheat_issues'] = fwd_issues + rev_issues
+                    pair['total_score'] = max(0, min(100, pair['total_score'] + (fwd_bonus + rev_bonus) / 2))
+                    
+                    # 两个引物都在3'半区给额外奖励
+                    if fwd_position > 0.5 and rev_position > 0.6:
+                        pair['total_score'] = min(100, pair['total_score'] + 10)
+                
+                # 重新排序
+                primer3_results.sort(key=lambda x: x['total_score'], reverse=True)
+            
+            return primer3_results
+    
+    # === 回退到手动设计 ===
     
     # === 小麦模式：避开5'端保守区 ===
     wheat_avoid_region = 0
@@ -2303,7 +3006,25 @@ def show_help():
     """帮助文档"""
     st.markdown("### 📖 使用帮助")
     
+    # 显示Primer3状态
+    if PRIMER3_AVAILABLE:
+        st.success("✅ Primer3-py库已加载 - 使用专业热力学计算")
+    else:
+        st.warning("⚠️ Primer3-py库未安装 - 使用内置算法。建议安装: `pip install primer3-py`")
+    
     st.markdown("""
+    ## 关于本工具 (v6.0 Primer3重构版)
+    
+    本工具使用 **Primer3-py** 库进行专业的引物设计和热力学分析，参考了 **polyoligo-kasp** 的设计理念。
+    
+    ### 核心特性
+    - 🔬 **Primer3引擎**: 使用SantaLucia最近邻法精确计算Tm值
+    - 🧬 **热力学分析**: 专业的发夹、二聚体dG/Tm计算
+    - 🌾 **小麦模式**: 针对六倍体小麦的五大忌检测
+    - 📊 **综合评分**: 多维度引物质量评估
+    
+    ---
+    
     ## KASP引物设计
     
     **KASP (Kompetitive Allele Specific PCR)** 是一种基于荧光的SNP基因分型技术。
@@ -2332,17 +3053,23 @@ def show_help():
     
     ## 常规PCR引物设计
     
-    用于设计普通PCR扩增引物对。
+    用于设计普通PCR扩增引物对。优先使用Primer3引擎，失败时回退到手动算法。
     
     ### 设计原则
     - 引物长度: 18-25 bp
-    - Tm值: 55-68°C
+    - Tm值: 55-68°C (SantaLucia法)
     - GC含量: 40-60%
     - 产物大小: 可自定义
     
+    ### 热力学参数 (Primer3)
+    - 单价阳离子: 50 mM
+    - 二价阳离子: 1.5 mM (Mg²⁺)
+    - dNTP浓度: 0.6 mM
+    - DNA浓度: 250 nM
+    
     ### 注意事项
-    - 避免引物3'端自身互补
-    - 避免引物对之间形成二聚体
+    - 避免引物3'端自身互补 (发夹 Tm < 45°C)
+    - 避免引物对之间形成二聚体 (dG > -9 kcal/mol)
     - 两条引物Tm差异应 <2°C
     
     ---
@@ -2354,12 +3081,18 @@ def show_help():
     1. 序列太短
     2. GC含量过高或过低
     3. 序列中有过多重复
+    4. 没有找到满足热力学条件的候选
     
     **Q: 如何提高引物质量？**
     A: 
     1. 提供更长的侧翼序列
     2. 选择GC含量适中的区域
     3. 调整参数设置
+    4. 安装primer3-py库获得更精确的计算
+    
+    **Q: Primer3和内置算法有什么区别？**
+    A: Primer3使用经过验证的SantaLucia热力学参数，Tm计算误差通常<2°C，
+       并提供精确的发夹/二聚体dG和Tm值。内置算法是简化版本。
     """)
 
 
@@ -2368,7 +3101,7 @@ def show_help():
 def main():
     # 侧边栏导航
     st.sidebar.markdown("## 🧬 引物设计工具")
-    st.sidebar.markdown("**v5.0 Web版**")
+    st.sidebar.markdown("**v6.0 Web版 (Primer3)**")
     st.sidebar.markdown("---")
     
     page = st.sidebar.radio(
