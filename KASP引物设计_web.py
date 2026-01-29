@@ -3414,15 +3414,18 @@ def main():
     page_options = ["🏠 首页", "🔬 KASP引物设计", "🧪 常规PCR引物设计", "🔍 引物分析", "📖 帮助文档"]
     current_index = page_options.index(st.session_state['page']) if st.session_state['page'] in page_options else 0
     
-    selected_page = st.sidebar.radio(
+    # Radio选择，不使用key自动binding，而是手动更新
+    selected_index = st.sidebar.radio(
         "选择功能",
-        page_options,
+        range(len(page_options)),
+        format_func=lambda i: page_options[i],
         index=current_index,
-        key="page_radio"
+        label_visibility="collapsed"
     )
     
-    # 更新session_state中的page
-    st.session_state['page'] = selected_page
+    # 更新session_state
+    st.session_state['page'] = page_options[selected_index]
+    page = st.session_state['page']
     
     st.sidebar.markdown("---")
     
@@ -3447,7 +3450,7 @@ def main():
     """, unsafe_allow_html=True)
     
     # 页面路由
-    if st.session_state['page'] == "🏠 首页":
+    if page == "🏠 首页":
         st.markdown('<p class="main-header">🧬 引物设计工具</p>', unsafe_allow_html=True)
         st.markdown('<p class="sub-header">KASP & 常规PCR 引物设计平台 v6.0 (Primer3-py)</p>', unsafe_allow_html=True)
         
@@ -3516,16 +3519,16 @@ def main():
                 c4.metric("评分", f"{result['score']:.0f}")
                 c5.metric("等级", f"{grade}")
     
-    elif st.session_state['page'] == "🔬 KASP引物设计":
+    elif page == "🔬 KASP引物设计":
         show_kasp_design()
     
-    elif st.session_state['page'] == "🧪 常规PCR引物设计":
+    elif page == "🧪 常规PCR引物设计":
         show_regular_pcr_design()
     
-    elif st.session_state['page'] == "🔍 引物分析":
+    elif page == "🔍 引物分析":
         show_primer_analysis()
     
-    elif st.session_state['page'] == "📖 帮助文档":
+    elif page == "📖 帮助文档":
         show_help()
 
 
