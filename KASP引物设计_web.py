@@ -2937,6 +2937,12 @@ def show_primer_analysis():
         st.session_state['temp_primer1_name'] = ""
     if 'temp_primer2_name' not in st.session_state:
         st.session_state['temp_primer2_name'] = ""
+    if 'temp_kasp_allele1_input' not in st.session_state:
+        st.session_state['temp_kasp_allele1_input'] = ""
+    if 'temp_kasp_allele2_input' not in st.session_state:
+        st.session_state['temp_kasp_allele2_input'] = ""
+    if 'temp_kasp_common_input' not in st.session_state:
+        st.session_state['temp_kasp_common_input'] = ""
     
     st.markdown("""
     <div class="info-box">
@@ -3162,18 +3168,48 @@ def show_primer_analysis():
     elif analysis_mode == "引物对分析":
         st.markdown("#### 📝 输入引物对序列")
         
+        # 检测是否有引物对临时输入
+        has_temp_pair_input = st.session_state.get('temp_primer1_input') and st.session_state.get('temp_primer2_input')
+        if has_temp_pair_input:
+            st.info(f"💫 检测到未保存的编辑内容")
+            pair_col1, pair_col2 = st.columns([1, 1])
+            with pair_col1:
+                if st.button("✏️ 恢复编辑", use_container_width=True, key="restore_temp_pair_input"):
+                    pass
+            with pair_col2:
+                if st.button("🗑️ 清除草稿", use_container_width=True, key="clear_temp_pair_input"):
+                    st.session_state['temp_primer1_input'] = ""
+                    st.session_state['temp_primer2_input'] = ""
+                    st.session_state['temp_primer1_name'] = ""
+                    st.session_state['temp_primer2_name'] = ""
+                    st.rerun()
+        
         col1, col2 = st.columns(2)
         with col1:
             fwd_input = st.text_area("正向引物 (Forward 5'→3')", 
+                                     value=st.session_state.get('temp_primer1_input', ""),
                                      placeholder="ATGCGATCGATCGATCG",
-                                     height=100)
-            fwd_name = st.text_input("正向引物名称", value="Forward_Primer")
+                                     height=100,
+                                     key="pair_fwd_input")
+            # 自动保存到临时缓冲区
+            st.session_state['temp_primer1_input'] = fwd_input
+            
+            fwd_name = st.text_input("正向引物名称", value=st.session_state.get('temp_primer1_name', "Forward_Primer"), key="pair_fwd_name")
+            # 自动保存
+            st.session_state['temp_primer1_name'] = fwd_name
         
         with col2:
             rev_input = st.text_area("反向引物 (Reverse 5'→3')", 
+                                     value=st.session_state.get('temp_primer2_input', ""),
                                      placeholder="CGATCGATCGATCGAT",
-                                     height=100)
-            rev_name = st.text_input("反向引物名称", value="Reverse_Primer")
+                                     height=100,
+                                     key="pair_rev_input")
+            # 自动保存到临时缓冲区
+            st.session_state['temp_primer2_input'] = rev_input
+            
+            rev_name = st.text_input("反向引物名称", value=st.session_state.get('temp_primer2_name', "Reverse_Primer"), key="pair_rev_name")
+            # 自动保存
+            st.session_state['temp_primer2_name'] = rev_name
         
         if st.button("🔍 分析引物对", type="primary"):
             if not fwd_input or not rev_input:
@@ -3288,13 +3324,47 @@ def show_primer_analysis():
     else:  # 小麦KASP引物分析
         st.markdown("#### 📝 输入KASP引物组")
         
+        # 检测是否有KASP临时输入
+        has_temp_kasp_input = (st.session_state.get('temp_kasp_allele1_input') or 
+                               st.session_state.get('temp_kasp_allele2_input') or 
+                               st.session_state.get('temp_kasp_common_input'))
+        if has_temp_kasp_input:
+            st.info(f"💫 检测到未保存的编辑内容")
+            kasp_col1, kasp_col2 = st.columns([1, 1])
+            with kasp_col1:
+                if st.button("✏️ 恢复编辑", use_container_width=True, key="restore_temp_kasp_input"):
+                    pass
+            with kasp_col2:
+                if st.button("🗑️ 清除草稿", use_container_width=True, key="clear_temp_kasp_input"):
+                    st.session_state['temp_kasp_allele1_input'] = ""
+                    st.session_state['temp_kasp_allele2_input'] = ""
+                    st.session_state['temp_kasp_common_input'] = ""
+                    st.rerun()
+        
         st.info("""**小麦KASP引物组包括：**
 - 2条等位基因特异性引物（带FAM/HEX荧光尾巴）
 - 1条通用反向引物（Common Primer）""")
         
-        allele1_input = st.text_area("Allele 1 引物（完整，含FAM尾巴）", height=80)
-        allele2_input = st.text_area("Allele 2 引物（完整，含HEX尾巴）", height=80)
-        common_input = st.text_area("Common 反向引物", height=80)
+        allele1_input = st.text_area("Allele 1 引物（完整，含FAM尾巴）", 
+                                     value=st.session_state.get('temp_kasp_allele1_input', ""),
+                                     height=80,
+                                     key="kasp_allele1_area")
+        # 自动保存到临时缓冲区
+        st.session_state['temp_kasp_allele1_input'] = allele1_input
+        
+        allele2_input = st.text_area("Allele 2 引物（完整，含HEX尾巴）", 
+                                     value=st.session_state.get('temp_kasp_allele2_input', ""),
+                                     height=80,
+                                     key="kasp_allele2_area")
+        # 自动保存到临时缓冲区
+        st.session_state['temp_kasp_allele2_input'] = allele2_input
+        
+        common_input = st.text_area("Common 反向引物", 
+                                    value=st.session_state.get('temp_kasp_common_input', ""),
+                                    height=80,
+                                    key="kasp_common_area")
+        # 自动保存到临时缓冲区
+        st.session_state['temp_kasp_common_input'] = common_input
         
         if st.button("🌾 分析小麦KASP引物", type="primary"):
             if not (allele1_input and allele2_input and common_input):
