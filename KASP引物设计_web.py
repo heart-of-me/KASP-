@@ -2205,8 +2205,40 @@ GGAGACCCGCAAGGCGCTCGGATCGGCTTACCACTCCATGATGATGGTGGAGCAGGTCCACCTGGGGAAGAGCGCCAACT
     if 'restore_last' not in st.session_state:
         st.session_state['restore_last'] = False
     
+    # 初始化临时编辑缓冲区（用于页面切换时保存未提交的输入）
+    if 'temp_seq_input' not in st.session_state:
+        st.session_state['temp_seq_input'] = None
+    if 'temp_seq_id' not in st.session_state:
+        st.session_state['temp_seq_id'] = None
+    if 'temp_num_schemes' not in st.session_state:
+        st.session_state['temp_num_schemes'] = 5
+    if 'temp_wheat_mode' not in st.session_state:
+        st.session_state['temp_wheat_mode'] = False
+    if 'temp_min_primer_len' not in st.session_state:
+        st.session_state['temp_min_primer_len'] = 18
+    if 'temp_max_primer_len' not in st.session_state:
+        st.session_state['temp_max_primer_len'] = 30
+    if 'temp_min_tm' not in st.session_state:
+        st.session_state['temp_min_tm'] = 55.0
+    if 'temp_max_tm' not in st.session_state:
+        st.session_state['temp_max_tm'] = 68.0
+    
     # 检查是否有保存的上次输入
     has_saved_input = st.session_state['last_snp_input'] is not None
+    
+    # 显示临时输入恢复提示（如果有临时保存的输入且不是从上次输入恢复）
+    has_temp_input = st.session_state['temp_seq_input'] is not None and not st.session_state.get('restore_last', False)
+    if has_temp_input:
+        st.info(f"💫 检测到未保存的编辑内容 | [{st.session_state['temp_seq_id'] or '未命名'}]")
+        temp_col1, temp_col2 = st.columns([1, 1])
+        with temp_col1:
+            if st.button("✏️ 恢复编辑", use_container_width=True, key="restore_temp_input"):
+                st.session_state['restore_last'] = False
+        with temp_col2:
+            if st.button("🗑️ 清除草稿", use_container_width=True, key="clear_temp_input"):
+                st.session_state['temp_seq_input'] = None
+                st.session_state['temp_seq_id'] = None
+                st.rerun()
     
     col1, col2 = st.columns([2, 1])
     
@@ -2226,10 +2258,13 @@ GGAGACCCGCAAGGCGCTCGGATCGGCTTACCACTCCATGATGATGGTGGAGCAGGTCCACCTGGGGAAGAGCGCCAACT
                     st.session_state['last_snp_input'] = None
                     st.rerun()
         
-        # 判断使用恢复的值还是示例
+        # 判断使用恢复的值、临时保存值还是示例
         if has_saved_input and st.session_state.get('restore_last', False):
             default_seq = st.session_state['last_snp_input'].get('sequence', example_seq)
             default_id = st.session_state['last_snp_input'].get('seq_id', 'My_SNP_Marker')
+        elif st.session_state['temp_seq_input'] is not None:
+            default_seq = st.session_state['temp_seq_input']
+            default_id = st.session_state['temp_seq_id'] or 'My_SNP_Marker'
         else:
             default_seq = example_seq
             default_id = 'My_SNP_Marker'
@@ -2238,19 +2273,28 @@ GGAGACCCGCAAGGCGCTCGGATCGGCTTACCACTCCATGATGATGGTGGAGCAGGTCCACCTGGGGAAGAGCGCCAACT
             "输入序列（包含SNP标记）",
             value=default_seq,
             height=200,
-            help="SNP位点使用 [碱基1/碱基2] 格式标记"
+            help="SNP位点使用 [碱基1/碱基2] 格式标记",
+            key="seq_input_field"
         )
+        # 自动保存当前编辑内容到临时缓冲区
+        st.session_state['temp_seq_input'] = seq_input
         
-        seq_id = st.text_input("序列ID（可选）", value=default_id)
+        seq_id = st.text_input("序列ID（可选）", value=default_id, key="seq_id_field")
+        # 自动保存序列ID到临时缓冲区
+        st.session_state['temp_seq_id'] = seq_id
     
     with col2:
         st.markdown("**参数设置**")
-        num_schemes = st.slider("生成方案数", 3, 15, 5)
+        num_schemes = st.slider("生成方案数", 3, 15, st.session_state.get('temp_num_schemes', 5), key="num_schemes_slider")
+        # 保存到临时缓冲区
+        st.session_state['temp_num_schemes'] = num_schemes
         
         # 🌾 小麦模式
         st.markdown("---")
-        wheat_mode = st.checkbox("🌾 小麦KASP模式", value=False,
-                                  help="针对小麦六倍体(AABBDD)优化，检测五大忌")
+        wheat_mode = st.checkbox("🌾 小麦KASP模式", value=st.session_state.get('temp_wheat_mode', False),
+                                  help="针对小麦六倍体(AABBDD)优化，检测五大忌", key="wheat_mode_check")
+        # 保存到临时缓冲区
+        st.session_state['temp_wheat_mode'] = wheat_mode
         
         if wheat_mode:
             st.warning("""**🌾 小麦五大忌检测已启用：**
@@ -2261,10 +2305,14 @@ GGAGACCCGCAAGGCGCTCGGATCGGCTTACCACTCCATGATGATGGTGGAGCAGGTCCACCTGGGGAAGAGCGCCAACT
 5️⃣ 重复序列 → 检测转座子/SSR""")
         
         with st.expander("高级参数"):
-            min_primer_len = st.number_input("最小引物长度", 15, 25, 18)
-            max_primer_len = st.number_input("最大引物长度", 20, 35, 30)
-            min_tm = st.number_input("最低Tm (°C)", 50.0, 60.0, 55.0)
-            max_tm = st.number_input("最高Tm (°C)", 60.0, 75.0, 68.0)
+            min_primer_len = st.number_input("最小引物长度", 15, 25, st.session_state.get('temp_min_primer_len', 18), key="min_primer_len_input")
+            st.session_state['temp_min_primer_len'] = min_primer_len
+            max_primer_len = st.number_input("最大引物长度", 20, 35, st.session_state.get('temp_max_primer_len', 30), key="max_primer_len_input")
+            st.session_state['temp_max_primer_len'] = max_primer_len
+            min_tm = st.number_input("最低Tm (°C)", 50.0, 60.0, st.session_state.get('temp_min_tm', 55.0), key="min_tm_input")
+            st.session_state['temp_min_tm'] = min_tm
+            max_tm = st.number_input("最高Tm (°C)", 60.0, 75.0, st.session_state.get('temp_max_tm', 68.0), key="max_tm_input")
+            st.session_state['temp_max_tm'] = max_tm
             
             if wheat_mode:
                 st.markdown("**小麦专用参数**")
@@ -2684,6 +2732,48 @@ def show_regular_pcr_design():
             
             st.success(f"✅ 成功设计 {len(pairs)} 对引物！")
             st.caption(f"序列长度: {len(sequence)} bp")
+            
+            # 生物学验证提示
+            st.markdown("---")
+            st.markdown("### 🧪 生物学验证（推荐）")
+            
+            with st.expander("📍 Ensembl Plants BLAST验证步骤", expanded=False):
+                st.markdown("""
+**目标：** 确认你的引物序列在目标物种上有完美匹配，不在其他物种或非目标区域产生高匹配。
+
+**步骤：**
+
+1. **打开工具**
+   - 访问 [Ensembl Plants BLAST](https://plants.ensembl.org/Multi/Tools/Blast?db=core)
+   - 或使用 [NCBI BLAST](https://blast.ncbi.nlm.nih.gov/)
+
+2. **输入序列**
+   - 复制你的正向或反向引物序列
+   - 粘贴到BLAST输入框
+
+3. **关键设置**
+   - **Search against:** 选择目标物种及其参考基因组版本
+   - **Program:** megablast (对于相同或相似的序列)
+   - 保持其他参数默认
+
+4. **点击 Run BLAST**
+
+5. **分析结果**
+   
+   ✅ **理想情况：**
+   - 看到一个 **100% Identity** 的匹配，对应你的 **目标基因组/染色体**
+   - 其他可能的匹配度 <90% 或中间有大的 Gap
+   - 说明你的引物特异性良好 ✓
+
+   ⚠️ **问题情况：**
+   - 在 **非目标区域** 看到 **99%-100% 匹配** 
+   - 说明这条序列存在 **同源干扰**，不能用
+   - **解决方案：** 修改引物设计或选择其他方案
+
+**小麦特例：** 如果你针对小麦设计，建议用 [PolyMarker](http://polymarker.tgac.ac.uk/) 工具，自动对 A/B/D 三个基因组进行 BLAST。
+
+**注意：** 本工具不直接实现BLAST功能，但强烈建议在使用引物前进行此验证。
+                """)
             
             # 显示每对引物
             for i, pair in enumerate(pairs, 1):
@@ -3311,15 +3401,28 @@ def show_help():
 # ==================== 主程序 ====================
 
 def main():
+    # 初始化页面选择状态
+    if 'page' not in st.session_state:
+        st.session_state['page'] = "🏠 首页"
+    
     # 侧边栏导航
     st.sidebar.markdown("## 🧬 引物设计工具")
     st.sidebar.markdown("**v6.0 Web版 (Primer3)**")
     st.sidebar.markdown("---")
     
-    page = st.sidebar.radio(
+    # 使用session_state管理页面选择，支持程序内跳转
+    page_options = ["🏠 首页", "🔬 KASP引物设计", "🧪 常规PCR引物设计", "🔍 引物分析", "📖 帮助文档"]
+    current_index = page_options.index(st.session_state['page']) if st.session_state['page'] in page_options else 0
+    
+    selected_page = st.sidebar.radio(
         "选择功能",
-        ["🏠 首页", "🔬 KASP引物设计", "🧪 常规PCR引物设计", "🔍 引物分析", "📖 帮助文档"]
+        page_options,
+        index=current_index,
+        key="page_radio"
     )
+    
+    # 更新session_state中的page
+    st.session_state['page'] = selected_page
     
     st.sidebar.markdown("---")
     
@@ -3344,7 +3447,7 @@ def main():
     """, unsafe_allow_html=True)
     
     # 页面路由
-    if page == "🏠 首页":
+    if st.session_state['page'] == "🏠 首页":
         st.markdown('<p class="main-header">🧬 引物设计工具</p>', unsafe_allow_html=True)
         st.markdown('<p class="sub-header">KASP & 常规PCR 引物设计平台 v6.0 (Primer3-py)</p>', unsafe_allow_html=True)
         
@@ -3413,16 +3516,16 @@ def main():
                 c4.metric("评分", f"{result['score']:.0f}")
                 c5.metric("等级", f"{grade}")
     
-    elif page == "🔬 KASP引物设计":
+    elif st.session_state['page'] == "🔬 KASP引物设计":
         show_kasp_design()
     
-    elif page == "🧪 常规PCR引物设计":
+    elif st.session_state['page'] == "🧪 常规PCR引物设计":
         show_regular_pcr_design()
     
-    elif page == "🔍 引物分析":
+    elif st.session_state['page'] == "🔍 引物分析":
         show_primer_analysis()
     
-    elif page == "📖 帮助文档":
+    elif st.session_state['page'] == "📖 帮助文档":
         show_help()
 
 
