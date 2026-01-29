@@ -2199,17 +2199,37 @@ def show_kasp_design():
 AAGAAGGCTGAGGAGCTGGAGGAATGGGTCACGGACTA[G/T]GTCGCGATATACTACGCCGACGGACTACTGTCGCGATGGTGATGAA
 GGAGACCCGCAAGGCGCTCGGATCGGCTTACCACTCCATGATGATGGTGGAGCAGGTCCACCTGGGGAAGAGCGCCAACTGGGACGAGCTCATCAAC"""
     
+    # 检查是否有保存的上次输入
+    has_saved_input = 'last_snp_input' in st.session_state
+    
     col1, col2 = st.columns([2, 1])
     
     with col1:
+        # 显示恢复选项
+        if has_saved_input:
+            restore_col1, restore_col2 = st.columns([3, 1])
+            with restore_col1:
+                st.info(f"💾 检测到上次输入 ({st.session_state['last_snp_input'].get('timestamp', '未知时间')})")
+            with restore_col2:
+                if st.button("📂 恢复", help="恢复上次输入的序列和参数", key="restore_last_input"):
+                    st.session_state['restore_last'] = True
+        
+        # 判断使用恢复的值还是示例
+        if has_saved_input and st.session_state.get('restore_last', False):
+            default_seq = st.session_state['last_snp_input'].get('sequence', example_seq)
+            default_id = st.session_state['last_snp_input'].get('seq_id', 'My_SNP_Marker')
+        else:
+            default_seq = example_seq
+            default_id = 'My_SNP_Marker'
+        
         seq_input = st.text_area(
             "输入序列（包含SNP标记）",
-            value=example_seq,
+            value=default_seq,
             height=200,
             help="SNP位点使用 [碱基1/碱基2] 格式标记"
         )
         
-        seq_id = st.text_input("序列ID（可选）", value="My_SNP_Marker")
+        seq_id = st.text_input("序列ID（可选）", value=default_id)
     
     with col2:
         st.markdown("**参数设置**")
@@ -2276,6 +2296,65 @@ GGAGACCCGCAAGGCGCTCGGATCGGCTTACCACTCCATGATGATGGTGGAGCAGGTCCACCTGGGGAAGAGCGCCAACT
 - 引物是否只在目标基因组有完美匹配
 - 是否需要在Common引物区域使用Genome-specific SNP
 - 推荐工具：[PolyMarker](http://polymarker.tgac.ac.uk/) | [CerealsDB](http://www.cerealsdb.uk.net/)""")
+            
+            # 生物学验证提示 (非小麦模式也显示)
+            st.markdown("---")
+            st.markdown("### 🧪 生物学验证（确保引物特异性）")
+            with st.expander("📍 Ensembl Plants BLAST验证步骤", expanded=False):
+                st.markdown("""
+**目标：** 确认你的序列在目标基因组上有完美匹配，不在其他基因组产生高匹配。
+（对于小麦，需要检查A、B、D三个基因组；对于其他物种，检查同源基因）
+
+**步骤：**
+
+1. **打开工具**
+   - 访问 [Ensembl Plants BLAST](https://plants.ensembl.org/tools/blast)
+   - 或使用 [NCBI BLAST](https://blast.ncbi.nlm.nih.gov/)
+
+2. **输入序列**
+   - 复制你的引物或产物序列
+   - 粘贴到BLAST输入框
+
+3. **关键设置（以小麦为例）**
+   - **Search against:** Wheat (Triticum aestivum) → **IWGSC (v2.1)**
+   - **Program:** megablast (对于相同或相似的序列)
+   - 保持其他参数默认
+
+4. **点击 Run BLAST**
+
+5. **分析结果（这一步决定成败）**
+   
+   ✅ **理想情况：**
+   - 看到一个 **100% Identity** 的匹配，对应你的 **目标基因组/染色体**
+   - 其他可能的匹配度数 <90% 或中间有大的 Gap
+   - 说明你的引物特异性良好 ✓
+
+   ⚠️ **问题情况：**
+   - 在 **非目标基因组** 上看到 **99%-100% 匹配** （尤其是小麦的其他基因组）
+   - 说明这条序列存在 **同源干扰**，不能用
+   - **解决方案：** 修改引物设计，尽量往内含子深处找，增加特异性
+
+   ❌ **不可接受：**
+   - 匹配位置分散
+   - 有大量高匹配
+
+**小麦特例：** 小麦是六倍体 (AABBDD)，需要单独检查每个基因组的匹配情况。
+建议使用 [PolyMarker](http://polymarker.tgac.ac.uk/) 工具，自动对 A/B/D 三个基因组进行 BLAST。
+
+**注意：** 本工具不直接实现BLAST功能，但强烈建议在使用引物前进行此验证。
+                """)
+            
+            # 保存输入信息到会话状态
+            st.session_state['last_snp_input'] = {
+                'sequence': seq_input,
+                'seq_id': seq_id,
+                'wheat_mode': wheat_mode,
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'upstream': upstream,
+                'downstream': downstream,
+                'allele1': allele1,
+                'allele2': allele2
+            }
             
             # 显示SNP信息
             st.markdown(f"""
