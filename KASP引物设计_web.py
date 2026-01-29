@@ -2640,6 +2640,42 @@ def show_regular_pcr_design():
     """常规PCR引物设计页面"""
     st.markdown("### 🧪 常规PCR引物设计")
     
+    # 初始化PCR临时保存字段
+    if 'temp_pcr_seq_input' not in st.session_state:
+        st.session_state['temp_pcr_seq_input'] = None
+    if 'temp_pcr_seq_id' not in st.session_state:
+        st.session_state['temp_pcr_seq_id'] = None
+    if 'temp_pcr_num_pairs' not in st.session_state:
+        st.session_state['temp_pcr_num_pairs'] = 5
+    if 'temp_pcr_product_min' not in st.session_state:
+        st.session_state['temp_pcr_product_min'] = 150
+    if 'temp_pcr_product_max' not in st.session_state:
+        st.session_state['temp_pcr_product_max'] = 500
+    if 'temp_pcr_wheat_mode' not in st.session_state:
+        st.session_state['temp_pcr_wheat_mode'] = False
+    if 'temp_pcr_avoid_5prime' not in st.session_state:
+        st.session_state['temp_pcr_avoid_5prime'] = 40
+    if 'temp_pcr_use_target' not in st.session_state:
+        st.session_state['temp_pcr_use_target'] = False
+    if 'temp_pcr_target_start' not in st.session_state:
+        st.session_state['temp_pcr_target_start'] = 50
+    if 'temp_pcr_target_end' not in st.session_state:
+        st.session_state['temp_pcr_target_end'] = 200
+    
+    # 显示临时输入恢复提示
+    has_temp_pcr_input = st.session_state['temp_pcr_seq_input'] is not None
+    if has_temp_pcr_input:
+        st.info(f"💫 检测到未保存的编辑内容 | [{st.session_state['temp_pcr_seq_id'] or '未命名'}]")
+        temp_col1, temp_col2 = st.columns([1, 1])
+        with temp_col1:
+            if st.button("✏️ 恢复编辑", use_container_width=True, key="restore_temp_pcr_input"):
+                pass
+        with temp_col2:
+            if st.button("🗑️ 清除草稿", use_container_width=True, key="clear_temp_pcr_input"):
+                st.session_state['temp_pcr_seq_input'] = None
+                st.session_state['temp_pcr_seq_id'] = None
+                st.rerun()
+    
     st.markdown("""
     <div class="info-box">
     <b>使用说明：</b><br>
@@ -2655,27 +2691,40 @@ def show_regular_pcr_design():
     col1, col2 = st.columns([2, 1])
     
     with col1:
+        # 判断使用临时保存值还是示例
+        default_seq = st.session_state['temp_pcr_seq_input'] if st.session_state['temp_pcr_seq_input'] else example_seq
+        default_id = st.session_state['temp_pcr_seq_id'] or "My_Gene"
+        
         seq_input = st.text_area(
             "输入序列",
-            value=example_seq,
+            value=default_seq,
             height=200,
-            help="输入纯碱基序列(A/T/G/C)"
+            help="输入纯碱基序列(A/T/G/C)",
+            key="pcr_seq_input_area"
         )
+        # 自动保存到临时缓冲区
+        st.session_state['temp_pcr_seq_input'] = seq_input
         
-        seq_id = st.text_input("序列ID（可选）", value="My_Gene", key="regular_seq_id")
+        seq_id = st.text_input("序列ID（可选）", value=default_id, key="regular_seq_id")
+        # 自动保存序列ID
+        st.session_state['temp_pcr_seq_id'] = seq_id
     
     with col2:
         st.markdown("**参数设置**")
-        num_pairs = st.slider("生成引物对数", 3, 10, 5, key="regular_num")
+        num_pairs = st.slider("生成引物对数", 3, 10, st.session_state.get('temp_pcr_num_pairs', 5), key="regular_num")
+        st.session_state['temp_pcr_num_pairs'] = num_pairs
         
         st.markdown("**产物大小范围**")
-        product_min = st.number_input("最小产物(bp)", 100, 500, 150)
-        product_max = st.number_input("最大产物(bp)", 200, 1000, 500)
+        product_min = st.number_input("最小产物(bp)", 100, 500, st.session_state.get('temp_pcr_product_min', 150), key="pcr_min_product")
+        st.session_state['temp_pcr_product_min'] = product_min
+        product_max = st.number_input("最大产物(bp)", 200, 1000, st.session_state.get('temp_pcr_product_max', 500), key="pcr_max_product")
+        st.session_state['temp_pcr_product_max'] = product_max
         
         # 小麦模式
         st.markdown("---")
-        wheat_mode = st.checkbox("🌾 小麦特异性模式", value=False, 
-                                  help="针对小麦A/B/D同源基因优化，避开5'端保守区")
+        wheat_mode = st.checkbox("🌾 小麦特异性模式", value=st.session_state.get('temp_pcr_wheat_mode', False),
+                                  help="针对小麦A/B/D同源基因优化，避开5'端保守区", key="pcr_wheat_mode")
+        st.session_state['temp_pcr_wheat_mode'] = wheat_mode
         
         if wheat_mode:
             st.info("""**小麦模式已启用：**
@@ -2684,19 +2733,23 @@ def show_regular_pcr_design():
 - 评估同源基因特异性""")
             
             with st.expander("🌾 小麦参数设置"):
-                avoid_5prime = st.slider("避开5'端区域(%)", 20, 60, 40,
-                                         help="避开序列5'端的百分比，该区域同源基因通常高度保守")
+                avoid_5prime = st.slider("避开5'端区域(%)", 20, 60, st.session_state.get('temp_pcr_avoid_5prime', 40),
+                                         help="避开序列5'端的百分比，该区域同源基因通常高度保守", key="pcr_avoid_5prime")
+                st.session_state['temp_pcr_avoid_5prime'] = avoid_5prime
                 prefer_3prime = st.checkbox("优先3'端区域", value=True,
-                                            help="3'UTR区域通常变异更多，有利于特异性扩增")
+                                            help="3'UTR区域通常变异更多，有利于特异性扩增", key="pcr_prefer_3prime")
         else:
             avoid_5prime = 40
             prefer_3prime = True
         
         with st.expander("目标区域（可选）"):
-            use_target = st.checkbox("指定目标区域")
+            use_target = st.checkbox("指定目标区域", value=st.session_state.get('temp_pcr_use_target', False), key="pcr_use_target")
+            st.session_state['temp_pcr_use_target'] = use_target
             if use_target:
-                target_start = st.number_input("起始位置", 1, 10000, 50)
-                target_end = st.number_input("结束位置", 1, 10000, 200)
+                target_start = st.number_input("起始位置", 1, 10000, st.session_state.get('temp_pcr_target_start', 50), key="pcr_target_start")
+                st.session_state['temp_pcr_target_start'] = target_start
+                target_end = st.number_input("结束位置", 1, 10000, st.session_state.get('temp_pcr_target_end', 200), key="pcr_target_end")
+                st.session_state['temp_pcr_target_end'] = target_end
             else:
                 target_start = None
                 target_end = None
@@ -2865,6 +2918,26 @@ def show_primer_analysis():
     """引物分析工具 - 增强版"""
     st.markdown("### 🔍 引物质量分析")
     
+    # 初始化分析页面临时保存字段
+    if 'temp_analysis_mode' not in st.session_state:
+        st.session_state['temp_analysis_mode'] = 0
+    if 'temp_primer_input' not in st.session_state:
+        st.session_state['temp_primer_input'] = ""
+    if 'temp_primer_name' not in st.session_state:
+        st.session_state['temp_primer_name'] = ""
+    if 'temp_primer_type' not in st.session_state:
+        st.session_state['temp_primer_type'] = "常规PCR"
+    if 'temp_check_wheat' not in st.session_state:
+        st.session_state['temp_check_wheat'] = False
+    if 'temp_primer1_input' not in st.session_state:
+        st.session_state['temp_primer1_input'] = ""
+    if 'temp_primer2_input' not in st.session_state:
+        st.session_state['temp_primer2_input'] = ""
+    if 'temp_primer1_name' not in st.session_state:
+        st.session_state['temp_primer1_name'] = ""
+    if 'temp_primer2_name' not in st.session_state:
+        st.session_state['temp_primer2_name'] = ""
+    
     st.markdown("""
     <div class="info-box">
     <b>功能说明：</b><br>
@@ -2876,28 +2949,49 @@ def show_primer_analysis():
     """, unsafe_allow_html=True)
     
     # 选择分析模式
+    analysis_modes = ["单引物分析", "引物对分析", "小麦KASP引物分析"]
+    current_mode_index = st.session_state.get('temp_analysis_mode', 0)
+    
     analysis_mode = st.radio(
         "选择分析模式",
-        ["单引物分析", "引物对分析", "小麦KASP引物分析"],
-        horizontal=True
+        range(len(analysis_modes)),
+        format_func=lambda i: analysis_modes[i],
+        index=current_mode_index,
+        horizontal=True,
+        label_visibility="collapsed",
+        key="analysis_mode_radio"
     )
+    # 保存到临时缓冲区
+    st.session_state['temp_analysis_mode'] = analysis_mode
     
-    if analysis_mode == "单引物分析":
+    if analysis_modes[analysis_mode] == "单引物分析":
         st.markdown("#### 📝 输入引物序列")
         primer_input = st.text_area(
             "引物序列 (5'→3')",
+            value=st.session_state.get('temp_primer_input', ""),
             placeholder="例如: ATGCGATCGATCGATCGATCG\n只输入ATGC碱基，自动过滤其他字符",
-            height=100
+            height=100,
+            key="analysis_primer_input"
         )
+        # 自动保存
+        st.session_state['temp_primer_input'] = primer_input
         
-        primer_name = st.text_input("引物名称（可选）", value="My_Primer")
+        primer_name = st.text_input("引物名称（可选）", value=st.session_state.get('temp_primer_name', "My_Primer"), key="analysis_primer_name")
+        # 自动保存
+        st.session_state['temp_primer_name'] = primer_name
         
         # 分析类型选择
         col1, col2 = st.columns(2)
         with col1:
-            primer_type = st.selectbox("引物类型", ["常规PCR", "KASP Allele", "KASP Common"])
+            primer_type_options = ["常规PCR", "KASP Allele", "KASP Common"]
+            current_type_idx = primer_type_options.index(st.session_state.get('temp_primer_type', "常规PCR"))
+            primer_type = st.selectbox("引物类型", range(len(primer_type_options)), format_func=lambda i: primer_type_options[i], 
+                                      index=current_type_idx, label_visibility="collapsed", key="analysis_primer_type")
+            st.session_state['temp_primer_type'] = primer_type_options[primer_type]
         with col2:
-            check_wheat = st.checkbox("小麦特异性检测", value=False)
+            check_wheat = st.checkbox("小麦特异性检测", value=st.session_state.get('temp_check_wheat', False), key="analysis_check_wheat")
+            # 自动保存
+            st.session_state['temp_check_wheat'] = check_wheat
         
         if st.button("🔍 开始分析", type="primary"):
             if not primer_input:
