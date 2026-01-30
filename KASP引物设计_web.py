@@ -44,6 +44,44 @@ pip install primer3-py
 ```
 当前使用内置算法（精度较低）""")
 
+
+def show_kasp_features_info():
+    """显示KASP引物设计的核心功能说明"""
+    with st.sidebar.expander("🔬 KASP设计核心功能", expanded=False):
+        st.markdown("""
+        ### 1️⃣ 人工错配 (Deliberate Mismatch)
+        
+        **LGC标准** - 在ASP引物3'端倒数第3位(n-3)引入人工错配
+        
+        - **强SNP (G/C)**: 使用强destabilizing错配
+        - **弱SNP (A/T)**: 使用中等destabilizing错配
+        
+        **作用**: 增强等位基因特异性，减少非特异性扩增
+        
+        ---
+        
+        ### 2️⃣ 救援模式 (Rescue Mode)
+        
+        自动处理**AT-rich序列**的两轮筛选机制:
+        
+        | 参数 | 标准模式 | 救援模式 |
+        |------|---------|---------|
+        | 最大长度 | 25bp | 32bp |
+        | GC下限 | 35% | 20% |
+        | Tm下限 | 55°C | 52°C |
+        
+        **触发**: 标准参数无法设计时自动启用
+        
+        ---
+        
+        ### 3️⃣ Tm平衡优化
+        
+        - **ASP引物**: 只计算核心序列Tm(不含FAM/HEX)
+        - **Common引物**: 目标Tm 60-62°C
+        - **匹配策略**: Common引物长度可达30bp以匹配ASP的Tm
+        """)
+
+
 # ==================== 自定义样式 ====================
 st.markdown("""
 <style>
@@ -102,23 +140,38 @@ class KASPConfig:
     """KASP引物设计配置参数"""
     FAM_TAIL: str = "GAAGGTGACCAAGTTCATGCT"
     HEX_TAIL: str = "GAAGGTCGGAGTCAACGGATT"
+    
+    # === 标准模式参数 ===
     MIN_PRIMER_LEN: int = 18
-    MAX_PRIMER_LEN: int = 30
+    MAX_PRIMER_LEN: int = 25      # 标准模式最大长度
     OPTIMAL_PRIMER_LEN: int = 20
     MIN_TM: float = 55.0
     MAX_TM: float = 68.0
     OPTIMAL_TM: float = 62.0
-    MIN_GC: float = 30.0  # 小麦大忌：避免<30%
-    MAX_GC: float = 65.0  # 小麦大忌：避免>65%
+    MIN_GC: float = 35.0          # 标准模式GC下限
+    MAX_GC: float = 65.0          # 小麦大忌：避免>65%
     OPTIMAL_GC_MIN: float = 40.0
     OPTIMAL_GC_MAX: float = 55.0
     MAX_TM_DIFF: float = 2.0
+    
     # KASP产物大小：小麦建议50-100bp
     REV_MIN_DISTANCE: int = 30   # 最近距离，产物约50bp
     REV_MAX_DISTANCE: int = 80   # 最远距离，产物约100bp
     PRODUCT_MIN: int = 50        # 小麦大忌#3：扩增子过长
     PRODUCT_MAX: int = 120       # KASP建议50-100bp
     MISMATCH_POSITIONS: List[int] = None
+    
+    # === 救援模式参数 (AT-rich序列) ===
+    RESCUE_MODE_ENABLED: bool = True       # 是否启用救援模式
+    RESCUE_MAX_PRIMER_LEN: int = 32        # 救援模式最大引物长度
+    RESCUE_MIN_GC: float = 20.0            # 救援模式GC下限
+    RESCUE_MIN_TM: float = 52.0            # 救援模式Tm下限
+    
+    # === Common引物Tm平衡参数 ===
+    COMMON_TARGET_TM: float = 61.0         # Common引物目标Tm
+    COMMON_TM_TOLERANCE: float = 1.5       # Common引物Tm容差
+    COMMON_MAX_LEN: int = 30               # Common引物最大长度(用于Tm平衡)
+    ASP_COMMON_TM_DIFF_MAX: float = 3.0    # ASP与Common的最大Tm差
     
     # 🌾 小麦特异性参数
     WHEAT_MODE: bool = False
@@ -128,7 +181,39 @@ class KASPConfig:
     
     def __post_init__(self):
         if self.MISMATCH_POSITIONS is None:
-            self.MISMATCH_POSITIONS = [-2, -3, -4]
+            self.MISMATCH_POSITIONS = [-3, -2, -4]  # 优先n-3位置
+    
+    def get_rescue_config(self) -> 'KASPConfig':
+        """
+        获取救援模式配置 (用于AT-rich序列)
+        放宽参数以确保能设计出引物
+        """
+        rescue = KASPConfig(
+            FAM_TAIL=self.FAM_TAIL,
+            HEX_TAIL=self.HEX_TAIL,
+            MIN_PRIMER_LEN=self.MIN_PRIMER_LEN,
+            MAX_PRIMER_LEN=self.RESCUE_MAX_PRIMER_LEN,  # 增加到32bp
+            OPTIMAL_PRIMER_LEN=24,                       # 最优长度增加
+            MIN_TM=self.RESCUE_MIN_TM,                   # 降低Tm下限
+            MAX_TM=self.MAX_TM,
+            OPTIMAL_TM=58.0,                             # 降低最优Tm
+            MIN_GC=self.RESCUE_MIN_GC,                   # 降低GC下限到20%
+            MAX_GC=self.MAX_GC,
+            OPTIMAL_GC_MIN=30.0,
+            OPTIMAL_GC_MAX=55.0,
+            MAX_TM_DIFF=3.0,                             # 放宽Tm差异
+            REV_MIN_DISTANCE=self.REV_MIN_DISTANCE,
+            REV_MAX_DISTANCE=self.REV_MAX_DISTANCE + 20,  # 扩大搜索范围
+            PRODUCT_MIN=self.PRODUCT_MIN,
+            PRODUCT_MAX=150,                              # 允许更长产物
+            MISMATCH_POSITIONS=self.MISMATCH_POSITIONS,
+            RESCUE_MODE_ENABLED=False,                    # 防止递归
+            WHEAT_MODE=self.WHEAT_MODE,
+            WHEAT_CHECK_FLANKING_SNP=self.WHEAT_CHECK_FLANKING_SNP,
+            WHEAT_CHECK_REPEAT=False,                     # 放宽重复检测
+            WHEAT_STRICT_GC=False,                        # 放宽GC检测
+        )
+        return rescue
 
 
 @dataclass
@@ -511,12 +596,140 @@ def check_3prime_stability(seq: str) -> Tuple[bool, str]:
         return True, "3'端以A/T结尾，可接受"
 
 
+# ==================== KASP人工错配模块 (LGC标准) ====================
+
+"""
+KASP人工错配(Deliberate Mismatch)说明:
+
+在KASP检测中，为了增强等位基因特异性(Allele Specificity)，需要在ASP引物的
+3'端倒数第2或第3位(n-2或n-3位置)引入人工错配碱基。
+
+原理：
+- SNP位点本身只产生一个错配，特异性可能不足
+- 引入额外错配可以"削弱"引物与非目标等位基因的结合
+- 需要根据SNP碱基的互补强度选择适当的错配
+
+LGC标准错配规则：
+- 强互补SNP (G/C)：需要强destabilizing错配
+- 弱互补SNP (A/T)：需要中等destabilizing错配
+"""
+
+# LGC KASP标准错配规则表
+# 格式: {(SNP碱基, 原始n-3碱基): 推荐错配碱基}
+# 原理: 根据SNP强度和n-3位置碱基选择最佳destabilizing mismatch
+
+KASP_MISMATCH_RULES = {
+    # ==== 强SNP (G或C) - 需要强错配 ====
+    # SNP=G时的错配规则
+    ('G', 'A'): 'C',  # A→C 强错配
+    ('G', 'T'): 'C',  # T→C 强错配
+    ('G', 'G'): 'A',  # G→A 强错配
+    ('G', 'C'): 'A',  # C→A 强错配
+    
+    # SNP=C时的错配规则
+    ('C', 'A'): 'C',  # A→C 强错配
+    ('C', 'T'): 'C',  # T→C 强错配
+    ('C', 'G'): 'A',  # G→A 强错配
+    ('C', 'C'): 'A',  # C→A 强错配
+    
+    # ==== 弱SNP (A或T) - 需要中等错配 ====
+    # SNP=A时的错配规则
+    ('A', 'A'): 'G',  # A→G 中等错配
+    ('A', 'T'): 'G',  # T→G 中等错配
+    ('A', 'G'): 'T',  # G→T 中等错配
+    ('A', 'C'): 'T',  # C→T 中等错配
+    
+    # SNP=T时的错配规则
+    ('T', 'A'): 'G',  # A→G 中等错配
+    ('T', 'T'): 'G',  # T→G 中等错配
+    ('T', 'G'): 'T',  # G→T 中等错配
+    ('T', 'C'): 'T',  # C→T 中等错配
+}
+
+# 备用错配规则（当标准规则不适用时）
+KASP_FALLBACK_MISMATCH = {
+    'A': 'C',  # A的最强destabilizer
+    'T': 'C',  # T的最强destabilizer  
+    'G': 'A',  # G的最强destabilizer
+    'C': 'A',  # C的最强destabilizer
+}
+
+
+def get_kasp_deliberate_mismatch(snp_base: str, original_n3_base: str) -> str:
+    """
+    获取KASP人工错配碱基 (LGC标准)
+    
+    参数:
+        snp_base: SNP位点的碱基 (引物3'端最后一个碱基)
+        original_n3_base: 引物倒数第3位的原始碱基
+    
+    返回:
+        推荐的错配碱基
+    
+    原理:
+        - 强SNP(G/C): 与模板形成3个氢键，需要强错配来destabilize
+        - 弱SNP(A/T): 与模板形成2个氢键，需要中等错配
+    """
+    snp_base = snp_base.upper()
+    original_n3_base = original_n3_base.upper()
+    
+    # 查找LGC标准规则
+    key = (snp_base, original_n3_base)
+    if key in KASP_MISMATCH_RULES:
+        return KASP_MISMATCH_RULES[key]
+    
+    # 回退到通用规则
+    return KASP_FALLBACK_MISMATCH.get(original_n3_base, 'A')
+
+
+def apply_deliberate_mismatch(core_seq: str, snp_base: str, mismatch_position: int = -3) -> Tuple[str, str, str]:
+    """
+    对引物序列应用人工错配
+    
+    参数:
+        core_seq: 不含SNP的核心引物序列
+        snp_base: SNP碱基 (将添加到3'端)
+        mismatch_position: 错配位置 (相对于3'端, 通常为-3)
+    
+    返回:
+        (带错配的完整引物, 原始碱基, 错配碱基)
+    """
+    if len(core_seq) < abs(mismatch_position):
+        # 序列太短，无法引入错配
+        return core_seq + snp_base, '', ''
+    
+    # 计算n-3位置的实际索引（在加入SNP之前）
+    # 最终引物 = core_seq + snp_base
+    # 所以n-3位置在core_seq中的索引 = len(core_seq) + mismatch_position
+    mismatch_idx = len(core_seq) + mismatch_position + 1  # +1因为SNP还未加入
+    
+    if mismatch_idx < 0 or mismatch_idx >= len(core_seq):
+        return core_seq + snp_base, '', ''
+    
+    original_base = core_seq[mismatch_idx]
+    mismatch_base = get_kasp_deliberate_mismatch(snp_base, original_base)
+    
+    # 如果计算出的错配碱基与原始碱基相同，尝试其他错配
+    if mismatch_base == original_base:
+        # 使用备用错配
+        alternatives = ['A', 'T', 'G', 'C']
+        alternatives.remove(original_base)
+        mismatch_base = alternatives[0]  # 选择第一个不同的碱基
+    
+    # 构建带错配的序列
+    modified_core = core_seq[:mismatch_idx] + mismatch_base + core_seq[mismatch_idx + 1:]
+    final_primer = modified_core + snp_base
+    
+    return final_primer, original_base, mismatch_base
+
+
 def get_strong_mismatch(original_base: str) -> str:
-    """获取强错配碱基"""
-    strong_mismatches = {
-        'A': 'A', 'T': 'T', 'G': 'A', 'C': 'A'
-    }
-    return strong_mismatches.get(original_base.upper(), 'A')
+    """
+    获取强错配碱基 (兼容旧接口)
+    
+    注意: 这是简化版本，建议使用get_kasp_deliberate_mismatch获得更精确的错配
+    """
+    return KASP_FALLBACK_MISMATCH.get(original_base.upper(), 'A')
 
 
 def evaluate_primer_quality(seq: str, config=None) -> Dict:
@@ -852,18 +1065,20 @@ def parse_snp_sequence(seq_with_snp: str) -> Tuple[str, str, str, str]:
 
 
 def design_kasp_common_primer_with_primer3(downstream: str, config: KASPConfig,
-                                            min_distance: int = 30, max_distance: int = 80) -> List[Dict]:
+                                            min_distance: int = 30, max_distance: int = 80,
+                                            target_tm: float = None) -> List[Dict]:
     """
-    使用Primer3设计KASP通用反向引物 - 参考polyoligo-kasp
+    使用Primer3设计KASP通用反向引物 - 优化Tm平衡版本
     
     参数:
         downstream: SNP下游序列
         config: KASP配置
         min_distance: 距SNP最小距离
         max_distance: 距SNP最大距离
+        target_tm: 目标Tm值（用于与ASP引物匹配），None则使用配置默认值
     
     返回:
-        反向引物候选列表
+        反向引物候选列表（按Tm匹配度排序）
     """
     if not PRIMER3_AVAILABLE:
         return []
@@ -874,29 +1089,37 @@ def design_kasp_common_primer_with_primer3(downstream: str, config: KASPConfig,
     if max_distance < min_distance:
         return []
     
+    # 如果没有指定目标Tm，使用Common引物目标Tm (60-62°C)
+    if target_tm is None:
+        target_tm = getattr(config, 'COMMON_TARGET_TM', 61.0)
+    
+    # Common引物可以使用更长的长度来达到目标Tm
+    common_max_len = getattr(config, 'COMMON_MAX_LEN', 30)
+    
     candidates = []
     
     # 使用Primer3的设计引擎只设计右引物
     seq_args = {
         'SEQUENCE_ID': 'kasp_common',
         'SEQUENCE_TEMPLATE': downstream,
-        'SEQUENCE_FORCE_LEFT_START': 0,  # 强制从0开始（但我们不用左引物）
+        'SEQUENCE_FORCE_LEFT_START': 0,
     }
     
     global_args = {
-        'PRIMER_TASK': 'pick_primer_list',  # 只选择引物，不配对
+        'PRIMER_TASK': 'pick_primer_list',
         'PRIMER_PICK_LEFT_PRIMER': 0,
         'PRIMER_PICK_RIGHT_PRIMER': 1,
         'PRIMER_PICK_INTERNAL_OLIGO': 0,
-        'PRIMER_NUM_RETURN': 20,
+        'PRIMER_NUM_RETURN': 30,  # 返回更多候选以便筛选
         
         'PRIMER_MIN_SIZE': config.MIN_PRIMER_LEN,
-        'PRIMER_OPT_SIZE': config.OPTIMAL_PRIMER_LEN,
-        'PRIMER_MAX_SIZE': config.MAX_PRIMER_LEN,
+        'PRIMER_OPT_SIZE': 22,  # Common引物最优长度稍长
+        'PRIMER_MAX_SIZE': common_max_len,  # 允许更长以达到Tm目标
         
-        'PRIMER_MIN_TM': config.MIN_TM,
-        'PRIMER_OPT_TM': config.OPTIMAL_TM,
-        'PRIMER_MAX_TM': config.MAX_TM,
+        # Tm参数 - 针对Common引物优化
+        'PRIMER_MIN_TM': target_tm - 3.0,
+        'PRIMER_OPT_TM': target_tm,
+        'PRIMER_MAX_TM': target_tm + 3.0,
         
         'PRIMER_MIN_GC': config.MIN_GC,
         'PRIMER_MAX_GC': config.MAX_GC,
@@ -913,7 +1136,7 @@ def design_kasp_common_primer_with_primer3(downstream: str, config: KASPConfig,
         'PRIMER_GC_CLAMP': 1,
         
         'PRIMER_PRODUCT_SIZE_RANGE': [[min_distance + config.MIN_PRIMER_LEN, 
-                                       max_distance + config.MAX_PRIMER_LEN]],
+                                       max_distance + common_max_len]],
     }
     
     try:
@@ -941,6 +1164,9 @@ def design_kasp_common_primer_with_primer3(downstream: str, config: KASPConfig,
                 has_hairpin, hairpin_tm = check_hairpin(seq)
                 has_dimer, dimer_dg, _ = check_homodimer(seq)
                 
+                # 计算与目标Tm的偏差（用于排序）
+                tm_deviation = abs(tm - target_tm)
+                
                 candidate = {
                     'sequence': seq,
                     'position': pos,
@@ -951,15 +1177,17 @@ def design_kasp_common_primer_with_primer3(downstream: str, config: KASPConfig,
                     'hairpin_tm': hairpin_tm,
                     'has_dimer': has_dimer,
                     'dimer_dg': dimer_dg,
-                    'penalty': results.get(f'PRIMER_RIGHT_{i}_PENALTY', 0)
+                    'penalty': results.get(f'PRIMER_RIGHT_{i}_PENALTY', 0),
+                    'tm_deviation': tm_deviation,
+                    'target_tm': target_tm
                 }
                 candidates.append(candidate)
                 
             except Exception:
                 continue
         
-        # 按penalty排序
-        candidates.sort(key=lambda x: x['penalty'])
+        # 按Tm偏差排序（优先选择Tm接近目标的引物）
+        candidates.sort(key=lambda x: (x['tm_deviation'], x['penalty']))
         
     except Exception:
         pass
@@ -968,10 +1196,26 @@ def design_kasp_common_primer_with_primer3(downstream: str, config: KASPConfig,
 
 
 def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, allele2: str, 
-                              config: KASPConfig = None, num_schemes: int = 5) -> List[Dict]:
+                              config: KASPConfig = None, num_schemes: int = 5,
+                              _is_rescue_mode: bool = False) -> List[Dict]:
     """
-    设计多套KASP引物方案 - 优化版 (支持Primer3)
-    确保不产生重复引物，质量不达标时返回空列表
+    设计多套KASP引物方案 - 优化版 (支持Primer3、人工错配、救援模式、Tm平衡)
+    
+    核心优化:
+    1. LGC标准人工错配(Deliberate Mismatch) - 增强等位基因特异性
+    2. 救援模式(Rescue Mode) - 处理AT-rich序列
+    3. Tm平衡优化 - ASP与Common引物Tm匹配
+    
+    参数:
+        upstream: SNP上游序列
+        downstream: SNP下游序列  
+        allele1, allele2: 两个等位基因碱基
+        config: KASP配置
+        num_schemes: 需要返回的方案数
+        _is_rescue_mode: 内部参数，标记是否处于救援模式
+    
+    返回:
+        引物方案列表，按质量评分排序
     """
     if config is None:
         config = KASPConfig()
@@ -985,16 +1229,10 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
     
     all_schemes = []
     
-    # === 使用Primer3预先设计Common引物候选 ===
-    primer3_common_candidates = []
-    if PRIMER3_AVAILABLE:
-        primer3_common_candidates = design_kasp_common_primer_with_primer3(
-            downstream, config,
-            min_distance=config.REV_MIN_DISTANCE,
-            max_distance=config.REV_MAX_DISTANCE
-        )
+    # === 第一步：设计ASP引物候选，计算平均Tm用于Common引物匹配 ===
+    asp_tm_values = []  # 收集ASP引物Tm值用于计算目标Tm
     
-    # 生成不同长度的正向引物
+    # 生成不同长度的ASP引物
     for primer_len in range(config.MIN_PRIMER_LEN, min(config.MAX_PRIMER_LEN + 1, len(upstream) + 1)):
         core_seq = upstream[-(primer_len - 1):]
         
@@ -1005,28 +1243,31 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
         if config.WHEAT_MODE and config.WHEAT_STRICT_GC:
             core_gc = calc_gc_content(core_seq)
             if core_gc > 65 or core_gc < 30:
-                continue  # 跳过GC极端的候选
+                continue
         
+        # === 使用LGC标准人工错配 ===
         for mismatch_pos in config.MISMATCH_POSITIONS:
             if abs(mismatch_pos) >= len(core_seq):
                 continue
             
-            mismatch_idx = len(core_seq) + mismatch_pos
-            original_base = core_seq[mismatch_idx]
-            mismatch_base = get_strong_mismatch(original_base)
+            # 应用人工错配到两个等位基因引物
+            # 注意：mismatch_pos是相对于最终引物3'端的位置
+            fwd_allele1, orig_base1, mismatch_base1 = apply_deliberate_mismatch(
+                core_seq, allele1, mismatch_position=mismatch_pos
+            )
+            fwd_allele2, orig_base2, mismatch_base2 = apply_deliberate_mismatch(
+                core_seq, allele2, mismatch_position=mismatch_pos
+            )
             
-            if mismatch_base == original_base:
+            # 验证错配是否有效（两个引物应该有相同的错配位置和变化）
+            if not mismatch_base1 or mismatch_base1 == orig_base1:
                 continue
             
-            core_with_mismatch = core_seq[:mismatch_idx] + mismatch_base + core_seq[mismatch_idx + 1:]
-            
-            fwd_allele1 = core_with_mismatch + allele1
-            fwd_allele2 = core_with_mismatch + allele2
-            
+            # 添加FAM/HEX尾巴
             fwd_with_fam = config.FAM_TAIL + fwd_allele1
             fwd_with_hex = config.HEX_TAIL + fwd_allele2
             
-            # 评估正向引物
+            # === ASP引物评估 (只计算核心序列的Tm，不含标签) ===
             eval1 = evaluate_primer_quality(fwd_allele1, config)
             eval2 = evaluate_primer_quality(fwd_allele2, config)
             
@@ -1034,16 +1275,42 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
             if eval1['score'] < 40 or eval2['score'] < 40:
                 continue
             
-            tm_diff = abs(eval1['tm'] - eval2['tm'])
+            # ASP引物间的Tm差异
+            asp_tm_diff = abs(eval1['tm'] - eval2['tm'])
             
             # Tm差异过大直接跳过
-            if tm_diff > config.MAX_TM_DIFF + 1:
+            if asp_tm_diff > config.MAX_TM_DIFF + 1:
                 continue
             
-            # 搜索反向引物
-            # === 优先使用Primer3设计的Common引物 ===
+            # 收集ASP的Tm用于Common引物设计
+            asp_avg_tm = (eval1['tm'] + eval2['tm']) / 2
+            asp_tm_values.append(asp_avg_tm)
+            
+            # 用于错配信息记录
+            original_base = orig_base1
+            mismatch_base = mismatch_base1
+            
+            # === 设计Common引物，目标Tm与ASP匹配 ===
+            # Common引物目标Tm略高于ASP，因为ASP有竞争反应
+            common_target_tm = asp_avg_tm + 0.5  # 略高0.5°C
+            common_target_tm = max(
+                getattr(config, 'COMMON_TARGET_TM', 61.0) - 2,
+                min(getattr(config, 'COMMON_TARGET_TM', 61.0) + 2, common_target_tm)
+            )
+            
+            # 使用Primer3设计Common引物（带Tm目标）
+            primer3_common_candidates = []
+            if PRIMER3_AVAILABLE:
+                primer3_common_candidates = design_kasp_common_primer_with_primer3(
+                    downstream, config,
+                    min_distance=config.REV_MIN_DISTANCE,
+                    max_distance=config.REV_MAX_DISTANCE,
+                    target_tm=common_target_tm
+                )
+            
+            # === 匹配Common引物 ===
             if primer3_common_candidates:
-                for common_cand in primer3_common_candidates[:10]:  # 最多使用前10个候选
+                for common_cand in primer3_common_candidates[:10]:
                     rev_seq = common_cand['sequence']
                     rev_dist = common_cand['distance']
                     
@@ -1052,31 +1319,44 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
                     if eval_rev['score'] < 40:
                         continue
                     
-                    # 检查引物二聚体 (使用Primer3的检测)
+                    # 检查引物二聚体
                     has_dimer_1, dimer_dg_1, _ = check_heterodimer(fwd_allele1, rev_seq)
                     has_dimer_2, dimer_dg_2, _ = check_heterodimer(fwd_allele2, rev_seq)
                     has_dimer = has_dimer_1 or has_dimer_2
                     
                     product_size = len(upstream) + 1 + rev_dist + len(rev_seq)
                     
-                    # 基础评分
-                    avg_fwd_score = (eval1['score'] + eval2['score']) / 2
-                    total_score = (avg_fwd_score * 0.4 + eval_rev['score'] * 0.3)
+                    # === Tm平衡评分 ===
+                    # ASP与Common的Tm差异
+                    asp_common_tm_diff = abs(asp_avg_tm - eval_rev['tm'])
+                    asp_common_max_diff = getattr(config, 'ASP_COMMON_TM_DIFF_MAX', 3.0)
                     
-                    # Tm匹配评分
-                    if tm_diff <= 0.5:
-                        total_score += 15
-                    elif tm_diff <= 1.0:
-                        total_score += 10
-                    elif tm_diff <= 2.0:
-                        total_score += 5
+                    # 综合评分
+                    avg_fwd_score = (eval1['score'] + eval2['score']) / 2
+                    total_score = (avg_fwd_score * 0.35 + eval_rev['score'] * 0.35)
+                    
+                    # ASP间Tm匹配评分
+                    if asp_tm_diff <= 0.5:
+                        total_score += 12
+                    elif asp_tm_diff <= 1.0:
+                        total_score += 8
+                    elif asp_tm_diff <= 2.0:
+                        total_score += 4
                     else:
+                        total_score -= 8
+                    
+                    # ASP-Common Tm匹配评分（新增）
+                    if asp_common_tm_diff <= 1.0:
+                        total_score += 10
+                    elif asp_common_tm_diff <= 2.0:
+                        total_score += 5
+                    elif asp_common_tm_diff > asp_common_max_diff:
                         total_score -= 10
                     
                     if has_dimer:
                         total_score -= 15
                     
-                    # 额外加分：来自Primer3的优化引物
+                    # Primer3优化加分
                     total_score += 5
                     
                     wheat_issues = []
@@ -1101,13 +1381,13 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
                             30 <= eval1['gc_content'] <= 65 and
                             30 <= eval_rev['gc_content'] <= 65 and
                             not has_dimer and
-                            tm_diff <= config.MAX_TM_DIFF
+                            asp_tm_diff <= config.MAX_TM_DIFF
                         )
                     else:
                         is_usable = (
                             total_score >= 45 and
                             not has_dimer and
-                            tm_diff <= config.MAX_TM_DIFF
+                            asp_tm_diff <= config.MAX_TM_DIFF
                         )
                     
                     scheme = {
@@ -1120,10 +1400,18 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
                         'allele2': allele2,
                         'mismatch_pos': mismatch_pos,
                         'mismatch_change': f"{original_base}→{mismatch_base}",
+                        'deliberate_mismatch_info': {
+                            'snp_bases': (allele1, allele2),
+                            'position': mismatch_pos,
+                            'original': original_base,
+                            'replacement': mismatch_base,
+                            'rule': 'LGC_STANDARD'
+                        },
                         'eval_fwd1': eval1,
                         'eval_fwd2': eval2,
                         'eval_rev': eval_rev,
-                        'tm_diff': tm_diff,
+                        'tm_diff': asp_tm_diff,
+                        'asp_common_tm_diff': asp_common_tm_diff,
                         'has_dimer': has_dimer,
                         'heterodimer_dg': min(dimer_dg_1 or 0, dimer_dg_2 or 0) if (dimer_dg_1 or dimer_dg_2) else None,
                         'product_size': product_size,
@@ -1133,17 +1421,20 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
                         'wheat_mode': config.WHEAT_MODE,
                         'wheat_issues': wheat_issues,
                         'wheat_details': wheat_details,
-                        'primer3_designed': True
+                        'primer3_designed': True,
+                        'rescue_mode': _is_rescue_mode
                     }
                     all_schemes.append(scheme)
             
             # === 回退：手动搜索反向引物 ===
+            common_max_len = getattr(config, 'COMMON_MAX_LEN', config.MAX_PRIMER_LEN)
             max_rev_dist = min(config.REV_MAX_DISTANCE + 1, len(downstream) - config.MIN_PRIMER_LEN + 1)
+            
             if max_rev_dist <= config.REV_MIN_DISTANCE:
                 continue
                 
             for rev_dist in range(config.REV_MIN_DISTANCE, max_rev_dist):
-                for rev_len in range(config.MIN_PRIMER_LEN, min(config.MAX_PRIMER_LEN + 1, len(downstream) - rev_dist + 1)):
+                for rev_len in range(config.MIN_PRIMER_LEN, min(common_max_len + 1, len(downstream) - rev_dist + 1)):
                     rev_start = rev_dist
                     rev_end = rev_dist + rev_len
                     
@@ -1164,6 +1455,10 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
                     if eval_rev['score'] < 40:
                         continue
                     
+                    # Tm平衡检查
+                    asp_common_tm_diff = abs(asp_avg_tm - eval_rev['tm'])
+                    asp_common_max_diff = getattr(config, 'ASP_COMMON_TM_DIFF_MAX', 3.0)
+                    
                     # 检查引物二聚体
                     has_dimer = (check_primer_dimer(fwd_allele1, rev_seq) or 
                                 check_primer_dimer(fwd_allele2, rev_seq))
@@ -1171,25 +1466,33 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
                     # 计算产物大小
                     product_size = len(upstream) + 1 + rev_dist + rev_len
                     
-                    # === 基础评分 ===
+                    # === 综合评分 ===
                     avg_fwd_score = (eval1['score'] + eval2['score']) / 2
-                    total_score = (avg_fwd_score * 0.4 + eval_rev['score'] * 0.3)
+                    total_score = (avg_fwd_score * 0.35 + eval_rev['score'] * 0.35)
                     
-                    # Tm匹配评分
-                    if tm_diff <= 0.5:
-                        total_score += 15
-                    elif tm_diff <= 1.0:
-                        total_score += 10
-                    elif tm_diff <= 2.0:
-                        total_score += 5
+                    # ASP间Tm匹配评分
+                    if asp_tm_diff <= 0.5:
+                        total_score += 12
+                    elif asp_tm_diff <= 1.0:
+                        total_score += 8
+                    elif asp_tm_diff <= 2.0:
+                        total_score += 4
                     else:
+                        total_score -= 8
+                    
+                    # ASP-Common Tm匹配评分
+                    if asp_common_tm_diff <= 1.0:
+                        total_score += 10
+                    elif asp_common_tm_diff <= 2.0:
+                        total_score += 5
+                    elif asp_common_tm_diff > asp_common_max_diff:
                         total_score -= 10
                     
                     # 二聚体惩罚
                     if has_dimer:
                         total_score -= 15
                     
-                    # === 小麦特异性评分（五大忌）===
+                    # 小麦特异性评分
                     wheat_issues = []
                     wheat_details = {}
                     
@@ -1199,18 +1502,16 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
                         )
                         total_score += wheat_bonus
                         
-                        # 大忌#3：扩增子长度评分
                         amplicon_status, amplicon_bonus = check_amplicon_length_kasp(product_size)
                         total_score += amplicon_bonus
                         wheat_details['amplicon_status'] = amplicon_status
                     else:
-                        # 非小麦模式的产物大小评分
                         if config.PRODUCT_MIN <= product_size <= config.PRODUCT_MAX:
                             total_score += 5
                     
                     total_score = max(0, min(100, total_score))
                     
-                    # 判断是否可用（小麦模式更严格）
+                    # 判断是否可用
                     is_usable = True
                     if config.WHEAT_MODE:
                         is_usable = (
@@ -1219,13 +1520,13 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
                             30 <= eval1['gc_content'] <= 65 and
                             30 <= eval_rev['gc_content'] <= 65 and
                             not has_dimer and
-                            tm_diff <= config.MAX_TM_DIFF
+                            asp_tm_diff <= config.MAX_TM_DIFF
                         )
                     else:
                         is_usable = (
                             total_score >= 45 and
                             not has_dimer and
-                            tm_diff <= config.MAX_TM_DIFF
+                            asp_tm_diff <= config.MAX_TM_DIFF
                         )
                     
                     scheme = {
@@ -1238,10 +1539,18 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
                         'allele2': allele2,
                         'mismatch_pos': mismatch_pos,
                         'mismatch_change': f"{original_base}→{mismatch_base}",
+                        'deliberate_mismatch_info': {
+                            'snp_bases': (allele1, allele2),
+                            'position': mismatch_pos,
+                            'original': original_base,
+                            'replacement': mismatch_base,
+                            'rule': 'LGC_STANDARD'
+                        },
                         'eval_fwd1': eval1,
                         'eval_fwd2': eval2,
                         'eval_rev': eval_rev,
-                        'tm_diff': tm_diff,
+                        'tm_diff': asp_tm_diff,
+                        'asp_common_tm_diff': asp_common_tm_diff,
                         'has_dimer': has_dimer,
                         'product_size': product_size,
                         'rev_distance': rev_dist,
@@ -1249,9 +1558,26 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
                         'is_usable': is_usable,
                         'wheat_mode': config.WHEAT_MODE,
                         'wheat_issues': wheat_issues,
-                        'wheat_details': wheat_details
+                        'wheat_details': wheat_details,
+                        'rescue_mode': _is_rescue_mode
                     }
                     all_schemes.append(scheme)
+    
+    # === 救援模式：如果标准模式没有找到方案，启用救援模式 ===
+    if not all_schemes and config.RESCUE_MODE_ENABLED and not _is_rescue_mode:
+        rescue_config = config.get_rescue_config()
+        rescue_schemes = design_kasp_primers_multi(
+            upstream, downstream, allele1, allele2,
+            config=rescue_config,
+            num_schemes=num_schemes,
+            _is_rescue_mode=True  # 标记为救援模式，防止无限递归
+        )
+        if rescue_schemes:
+            # 标记为救援模式设计的引物
+            for scheme in rescue_schemes:
+                scheme['rescue_mode'] = True
+                scheme['rescue_note'] = "⚠️ 该引物由救援模式设计（放宽参数），建议优先考虑标准模式引物"
+            return rescue_schemes
     
     # 如果没有找到任何方案，返回空列表
     if not all_schemes:
@@ -2075,26 +2401,31 @@ def design_regular_primers(sequence: str, config: RegularPCRConfig = None,
 # ==================== CSV导出函数 ====================
 
 def generate_kasp_csv(schemes: List[Dict], seq_id: str) -> str:
-    """生成KASP引物CSV内容"""
+    """生成KASP引物CSV内容 - 增强版（包含人工错配和救援模式信息）"""
     output = io.StringIO()
     writer = csv.writer(output)
     
-    writer.writerow(['KASP引物设计报告'])
+    writer.writerow(['KASP引物设计报告 (优化版 v7.0)'])
     writer.writerow(['序列ID', seq_id])
     writer.writerow(['生成时间', datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
     
     # 检查是否为小麦模式
     is_wheat_mode = schemes[0].get('wheat_mode', False) if schemes else False
+    has_rescue = any(s.get('rescue_mode', False) for s in schemes)
+    
     if is_wheat_mode:
         writer.writerow(['模式', '🌾 小麦KASP模式 (五大忌检测)'])
+    if has_rescue:
+        writer.writerow(['提示', '⚠️ 部分引物由救援模式设计（用于AT-rich序列）'])
+    writer.writerow(['人工错配', 'LGC标准 - 在n-3位置引入Deliberate Mismatch增强特异性'])
     writer.writerow([])
     
     # 表头
-    headers = ['方案', '评分', '等级', '可用性',
+    headers = ['方案', '评分', '等级', '可用性', '设计模式',
                'FAM引物(完整)', 'HEX引物(完整)', '通用反向引物',
-               'Allele1-Tm', 'Allele2-Tm', 'Tm差异',
+               'Allele1-Tm', 'Allele2-Tm', 'ASP Tm差', 'ASP-Common Tm差',
                'Allele1-GC%', 'Allele2-GC%', 'Rev-Tm', 'Rev-GC%',
-               '产物大小', '错配位置', '错配变化']
+               '产物大小', '错配位置', '错配变化', 'SNP类型']
     
     if is_wheat_mode:
         headers.extend(['小麦评估', '注意事项'])
@@ -2104,15 +2435,26 @@ def generate_kasp_csv(schemes: List[Dict], seq_id: str) -> str:
     for i, scheme in enumerate(schemes, 1):
         grade, stars, _ = get_quality_grade(scheme['total_score'])
         is_usable = scheme.get('is_usable', True)
+        rescue_mode = scheme.get('rescue_mode', False)
+        
+        # 获取人工错配详细信息
+        mismatch_info = scheme.get('deliberate_mismatch_info', {})
+        snp_bases = mismatch_info.get('snp_bases', (scheme.get('allele1', '?'), scheme.get('allele2', '?')))
+        snp_type = f"[{snp_bases[0]}/{snp_bases[1]}]"
+        
+        asp_common_diff = scheme.get('asp_common_tm_diff', 0)
         
         row = [
             f"方案{i}", f"{scheme['total_score']:.1f}", f"{grade} {stars}",
             "推荐" if is_usable else "慎用",
+            "救援模式" if rescue_mode else "标准模式",
             scheme['fwd_allele1_full'], scheme['fwd_allele2_full'], scheme['reverse'],
-            f"{scheme['eval_fwd1']['tm']}°C", f"{scheme['eval_fwd2']['tm']}°C", f"{scheme['tm_diff']:.1f}°C",
+            f"{scheme['eval_fwd1']['tm']}°C", f"{scheme['eval_fwd2']['tm']}°C", 
+            f"{scheme['tm_diff']:.1f}°C", f"{asp_common_diff:.1f}°C" if asp_common_diff else "N/A",
             f"{scheme['eval_fwd1']['gc_content']:.1f}%", f"{scheme['eval_fwd2']['gc_content']:.1f}%",
             f"{scheme['eval_rev']['tm']}°C", f"{scheme['eval_rev']['gc_content']:.1f}%",
-            f"{scheme['product_size']}bp", f"n{scheme['mismatch_pos']}", scheme['mismatch_change']
+            f"{scheme['product_size']}bp", f"n{scheme['mismatch_pos']}", scheme['mismatch_change'],
+            snp_type
         ]
         
         if is_wheat_mode:
@@ -2122,6 +2464,24 @@ def generate_kasp_csv(schemes: List[Dict], seq_id: str) -> str:
             row.append("; ".join(wheat_issues) if wheat_issues else "无")
         
         writer.writerow(row)
+    
+    # 人工错配说明
+    writer.writerow([])
+    writer.writerow(['=== LGC人工错配(Deliberate Mismatch)说明 ==='])
+    writer.writerow(['位置', 'n-3位置', '在ASP引物3\'端倒数第3位引入错配'])
+    writer.writerow(['作用', '增强特异性', '使非目标等位基因的引物结合更不稳定'])
+    writer.writerow(['规则', '强SNP(G/C)', '使用强destabilizing错配(如A→C)'])
+    writer.writerow(['规则', '弱SNP(A/T)', '使用中等destabilizing错配(如A→G)'])
+    
+    # 救援模式说明
+    if has_rescue:
+        writer.writerow([])
+        writer.writerow(['=== 救援模式说明 ==='])
+        writer.writerow(['触发条件', 'AT-rich序列', '标准参数无法设计出合格引物时自动触发'])
+        writer.writerow(['参数调整', '引物长度', '最大延长至30-32bp'])
+        writer.writerow(['参数调整', 'GC下限', '降低至20%'])
+        writer.writerow(['参数调整', 'Tm下限', '降低至52°C'])
+        writer.writerow(['注意', '实验验证', '救援模式引物需更多实验验证'])
     
     # 小麦模式提醒
     if is_wheat_mode:
@@ -2546,6 +2906,10 @@ A: v2.1 是当前最新的小麦参考基因组。如果有新版本发布，请
                         else:
                             st.error("⚠️ 该方案存在小麦特异性问题，请谨慎使用或选择其他方案")
                     
+                    # 救援模式提示
+                    if scheme.get('rescue_mode', False):
+                        st.warning("🆘 **救援模式引物**: 该引物由放宽参数设计（用于AT-rich序列），建议优先验证实验效果")
+                    
                     col_a, col_b = st.columns(2)
                     
                     with col_a:
@@ -2562,9 +2926,25 @@ A: v2.1 是当前最新的小麦参考基因组。如果有新版本发布，请
                         st.caption(f"{len(scheme['reverse'])}bp | Tm: {scheme['eval_rev']['tm']}°C | GC: {scheme['eval_rev']['gc_content']:.1f}% | 距SNP: {scheme['rev_distance']}bp")
                         
                         st.markdown("**产物信息**")
+                        # ASP间Tm差异
                         tm_status = "✓" if scheme['tm_diff'] <= 1.5 else ("△" if scheme['tm_diff'] <= 2.0 else "✗")
-                        st.write(f"Tm差异: {scheme['tm_diff']:.1f}°C {tm_status}")
-                        st.write(f"错配位置: n{scheme['mismatch_pos']} ({scheme['mismatch_change']})")
+                        st.write(f"ASP Tm差异: {scheme['tm_diff']:.1f}°C {tm_status}")
+                        
+                        # ASP-Common Tm差异（新增）
+                        asp_common_diff = scheme.get('asp_common_tm_diff', 0)
+                        if asp_common_diff:
+                            tm_balance_status = "✓" if asp_common_diff <= 2.0 else ("△" if asp_common_diff <= 3.0 else "✗")
+                            st.write(f"ASP-Common Tm差: {asp_common_diff:.1f}°C {tm_balance_status}")
+                        
+                        # 人工错配信息（增强版）
+                        mismatch_info = scheme.get('deliberate_mismatch_info', {})
+                        if mismatch_info:
+                            snp_bases = mismatch_info.get('snp_bases', ('?', '?'))
+                            st.write(f"🔬 **人工错配 (LGC标准)**")
+                            st.write(f"  位置: n{scheme['mismatch_pos']} | SNP: [{snp_bases[0]}/{snp_bases[1]}]")
+                            st.write(f"  变化: {scheme['mismatch_change']}")
+                        else:
+                            st.write(f"错配位置: n{scheme['mismatch_pos']} ({scheme['mismatch_change']})")
                         
                         # 产物大小评估（小麦模式）
                         if wheat_mode:
@@ -3596,11 +3976,14 @@ def main():
     # 显示Primer3状态
     show_primer3_status()
     
+    # 显示KASP核心功能说明
+    show_kasp_features_info()
+    
     st.sidebar.markdown("---")
     st.sidebar.markdown("""
     <small>
     
-    **关于本工具**
+    **关于本工具 v7.0**
     
     本工具用于设计KASP基因分型引物和常规PCR引物。
     
@@ -3609,6 +3992,11 @@ def main():
     - 发夹结构检测
     - 二聚体风险评估
     - 专业引物设计引擎
+    
+    **v7.0 新功能:**
+    - 🔬 LGC标准人工错配
+    - 🆘 AT-rich序列救援模式
+    - ⚖️ ASP-Common Tm平衡
     
     </small>
     """, unsafe_allow_html=True)
@@ -3635,9 +4023,11 @@ def main():
             针对SNP位点设计KASP基因分型引物
             
             - ✅ 自动添加FAM/HEX荧光尾巴
-            - ✅ 智能错配位点设计
+            - ✅ **LGC标准人工错配** (n-3位置)
+            - ✅ **救援模式** (AT-rich序列)
+            - ✅ **Tm平衡优化** (ASP-Common匹配)
             - ✅ 多方案评分排序
-            - ✅ 一键导出CSV
+            - ✅ 🌾 小麦模式 (五大忌检测)
             
             """)
             if st.button("开始KASP设计 →", key="goto_kasp"):
@@ -3659,6 +4049,33 @@ def main():
             if st.button("开始PCR设计 →", key="goto_pcr"):
                 st.session_state['page'] = "🧪 常规PCR引物设计"
                 st.rerun()
+        
+        # v7.0 新功能说明
+        st.markdown("---")
+        st.markdown("### ✨ v7.0 新功能亮点")
+        
+        feat_col1, feat_col2, feat_col3 = st.columns(3)
+        
+        with feat_col1:
+            st.info("""
+            **🔬 LGC人工错配**
+            
+            在ASP引物n-3位置引入deliberate mismatch，根据SNP强度选择最佳错配碱基，显著增强等位基因特异性。
+            """)
+        
+        with feat_col2:
+            st.info("""
+            **🆘 救援模式**
+            
+            自动检测AT-rich序列，放宽参数（长度32bp、GC 20%）确保设计成功，告别空结果。
+            """)
+        
+        with feat_col3:
+            st.info("""
+            **⚖️ Tm平衡**
+            
+            Common引物智能匹配ASP的Tm值(目标60-62°C)，可延长至30bp，确保PCR效率均衡。
+            """)
         
         st.markdown("---")
         
