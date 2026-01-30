@@ -4320,7 +4320,7 @@ def main():
     
     # 侧边栏导航
     st.sidebar.markdown("## 🧬 引物设计工具")
-    st.sidebar.markdown("**v6.0 Web版 (Primer3)**")
+    st.sidebar.markdown("**v7.0 Web版 (Primer3)**")
     st.sidebar.markdown("---")
     
     # 使用session_state管理页面选择，支持程序内跳转
