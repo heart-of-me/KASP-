@@ -187,6 +187,12 @@ class KASPConfig:
     COMMON_MAX_LEN: int = 30               # Common引物最大长度(用于Tm平衡)
     ASP_COMMON_TM_DIFF_MAX: float = 3.0    # ASP与Common的最大Tm差
     
+    # === Tm贪婪延伸优化参数 (LGC商业设计标准) ===
+    TM_GREEDY_EXTENSION: bool = True       # 是否启用Tm贪婪延伸
+    ASP_TARGET_TM_MIN: float = 60.0        # ASP引物目标Tm下限
+    ASP_TARGET_TM_MAX: float = 62.0        # ASP引物目标Tm上限 (LGC标准)
+    TM_GREEDY_TOLERANCE: float = 1.0       # Tm达标容差
+    
     # 🌾 小麦特异性参数
     WHEAT_MODE: bool = False
     WHEAT_CHECK_FLANKING_SNP: bool = True   # 大忌#2：检查侧翼干扰SNP
@@ -744,6 +750,242 @@ def get_strong_mismatch(original_base: str) -> str:
     注意: 这是简化版本，建议使用get_kasp_deliberate_mismatch获得更精确的错配
     """
     return KASP_FALLBACK_MISMATCH.get(original_base.upper(), 'A')
+
+
+# ============================================================
+# 新增函数：强制n-3错配 (按用户命名需求)
+# ============================================================
+
+def apply_n3_mismatch(primer_seq: str, snp_base: str) -> Tuple[str, str, str]:
+    """
+    强制在引物3'端倒数第3位(n-3)引入错配碱基
+    
+    这是LGC商业标准的核心特异性增强技术。
+    
+    参数:
+        primer_seq: 不含SNP的引物核心序列 (即上游序列)
+        snp_base: SNP位点碱基 (将添加到引物3'端)
+    
+    返回:
+        (带错配的完整引物序列, 原始n-3碱基, 替换后的错配碱基)
+    
+    示例:
+        输入: primer_seq="ATGCTCACCACCACTCT", snp_base="A"
+        最终引物 = "ATGCTCACCACCACTCT" + "A" + "C" = "ATGCTCACCACCACTCTAC" (21bp)
+        n-3位置是从3'端数第3位，即 "T" (index -3 of final primer)
+        但n-3位置在core_seq中是最后一位，需要在此处引入错配
+        
+        实际: n-3 = core_seq[-2]，因为最终引物 = core + SNP
+        所以 core[-2] 对应 final_primer[-3]
+    """
+    if len(primer_seq) < 2:
+        # 序列太短，无法引入错配
+        return primer_seq + snp_base, '', ''
+    
+    # n-3位置计算:
+    # 最终引物 = core_seq + snp_base
+    # final[-1] = snp_base
+    # final[-2] = core[-1]  
+    # final[-3] = core[-2]  <-- 这是我们要修改的位置
+    mismatch_idx = -2  # 在core_seq中的索引
+    
+    original_base = primer_seq[mismatch_idx].upper()
+    
+    # 使用LGC标准规则获取错配碱基
+    mismatch_base = get_kasp_deliberate_mismatch(snp_base.upper(), original_base)
+    
+    # 确保错配碱基与原始碱基不同
+    if mismatch_base == original_base:
+        # 选择最强的destabilizing碱基
+        alternatives = {'A': 'C', 'T': 'C', 'G': 'A', 'C': 'A'}
+        mismatch_base = alternatives.get(original_base, 'A')
+    
+    # 构建带错配的引物序列
+    modified_core = primer_seq[:mismatch_idx] + mismatch_base + primer_seq[mismatch_idx + 1:]
+    final_primer = modified_core + snp_base
+    
+    return final_primer, original_base, mismatch_base
+
+
+# ============================================================
+# 新增函数：Tm贪婪延伸算法 (5'端动态延伸)
+# ============================================================
+
+def optimize_5prime_extension(upstream: str, snp_base: str, config, 
+                               target_tm: float = 60.0,
+                               min_len: int = 18,
+                               max_len: int = 30,
+                               apply_mismatch: bool = True) -> List[Dict]:
+    """
+    Tm贪婪延伸算法：动态向5'端延伸引物以达到目标Tm
+    
+    复现LGC商业设计中"为了获得更好Tm而多取一个碱基"的行为。
+    
+    原理:
+        1. 从最小长度开始
+        2. 计算当前Tm
+        3. 如果Tm < 目标值，向5'端延伸1bp
+        4. 重复直到Tm达标或达到最大长度
+        5. 返回Tm最接近目标的所有候选
+    
+    参数:
+        upstream: SNP上游序列 (不含SNP位点)
+        snp_base: SNP碱基
+        config: KASPConfig配置对象
+        target_tm: 目标Tm值 (默认60°C，LGC标准范围60-62°C)
+        min_len: 最小引物长度 (默认18bp)
+        max_len: 最大引物长度 (默认30bp)
+        apply_mismatch: 是否应用n-3错配 (默认True)
+    
+    返回:
+        候选引物列表，按Tm与目标的接近程度排序
+        每个元素: {
+            'sequence': 完整引物序列,
+            'core_seq': 核心序列(不含SNP),
+            'length': 引物长度,
+            'tm': 计算的Tm值,
+            'tm_diff_from_target': 与目标Tm的差值,
+            'gc_content': GC含量,
+            'mismatch_info': 错配信息 (如果apply_mismatch=True)
+        }
+    """
+    candidates = []
+    
+    # 确保有足够的上游序列
+    available_len = len(upstream)
+    actual_min = max(min_len - 1, 3)  # core_seq长度 = primer_len - 1 (因为要加SNP)
+    actual_max = min(max_len - 1, available_len)
+    
+    if actual_max < actual_min:
+        return []
+    
+    # 贪婪延伸：从最小长度开始，逐步延伸
+    best_candidate = None
+    best_tm_diff = float('inf')
+    
+    for core_len in range(actual_min, actual_max + 1):
+        # 从上游序列3'端截取
+        core_seq = upstream[-core_len:]
+        
+        # 应用n-3错配
+        if apply_mismatch and len(core_seq) >= 2:
+            primer_seq, orig_base, mismatch_base = apply_n3_mismatch(core_seq, snp_base)
+            mismatch_info = {
+                'position': -3,
+                'original': orig_base,
+                'replacement': mismatch_base,
+                'applied': bool(mismatch_base and mismatch_base != orig_base)
+            }
+        else:
+            primer_seq = core_seq + snp_base
+            mismatch_info = {'applied': False}
+        
+        # 计算Tm (只计算核心序列，不含FAM/HEX标签)
+        tm_value = calc_tm(primer_seq)
+        gc_content = calc_gc_content(primer_seq)
+        
+        # 计算与目标Tm的差距
+        tm_diff = abs(tm_value - target_tm)
+        
+        candidate = {
+            'sequence': primer_seq,
+            'core_seq': core_seq,
+            'length': len(primer_seq),
+            'tm': tm_value,
+            'tm_diff_from_target': tm_diff,
+            'gc_content': gc_content,
+            'mismatch_info': mismatch_info
+        }
+        candidates.append(candidate)
+        
+        # 跟踪最佳候选
+        if tm_diff < best_tm_diff:
+            best_tm_diff = tm_diff
+            best_candidate = candidate
+        
+        # 贪婪优化：如果Tm已经达到或超过目标，可以停止延伸
+        # 但继续搜索几个以找到最优
+        if tm_value >= target_tm and len(candidates) >= 3:
+            # 再延伸2-3bp看看是否有更好的
+            extra_search = 3
+            for extra_len in range(core_len + 1, min(core_len + extra_search + 1, actual_max + 1)):
+                extra_core = upstream[-extra_len:]
+                if apply_mismatch and len(extra_core) >= 2:
+                    extra_primer, e_orig, e_mismatch = apply_n3_mismatch(extra_core, snp_base)
+                    e_mismatch_info = {
+                        'position': -3,
+                        'original': e_orig,
+                        'replacement': e_mismatch,
+                        'applied': bool(e_mismatch and e_mismatch != e_orig)
+                    }
+                else:
+                    extra_primer = extra_core + snp_base
+                    e_mismatch_info = {'applied': False}
+                
+                extra_tm = calc_tm(extra_primer)
+                extra_diff = abs(extra_tm - target_tm)
+                
+                candidates.append({
+                    'sequence': extra_primer,
+                    'core_seq': extra_core,
+                    'length': len(extra_primer),
+                    'tm': extra_tm,
+                    'tm_diff_from_target': extra_diff,
+                    'gc_content': calc_gc_content(extra_primer),
+                    'mismatch_info': e_mismatch_info
+                })
+            break
+    
+    # 按Tm与目标的接近程度排序
+    candidates.sort(key=lambda x: (x['tm_diff_from_target'], -x['length']))
+    
+    return candidates
+
+
+def design_optimal_asp_primer(upstream: str, snp_base: str, config,
+                               target_tm_range: Tuple[float, float] = (60.0, 62.0)) -> Optional[Dict]:
+    """
+    设计最优ASP引物：结合n-3错配和Tm贪婪延伸
+    
+    这是对LGC商业设计的完整复现，包括：
+    1. 强制n-3错配增强特异性
+    2. 动态5'延伸达到最佳Tm (60-62°C)
+    
+    参数:
+        upstream: SNP上游序列
+        snp_base: SNP碱基
+        config: KASPConfig配置
+        target_tm_range: 目标Tm范围 (默认60-62°C)
+    
+    返回:
+        最优引物信息字典，或None如果无法设计
+    """
+    target_tm = (target_tm_range[0] + target_tm_range[1]) / 2  # 目标Tm取中间值
+    
+    # 使用Tm贪婪延伸算法获取候选
+    candidates = optimize_5prime_extension(
+        upstream=upstream,
+        snp_base=snp_base,
+        config=config,
+        target_tm=target_tm,
+        min_len=getattr(config, 'MIN_PRIMER_LEN', 18),
+        max_len=getattr(config, 'MAX_PRIMER_LEN', 28),
+        apply_mismatch=True
+    )
+    
+    if not candidates:
+        return None
+    
+    # 筛选Tm在目标范围内的候选
+    in_range = [c for c in candidates 
+                if target_tm_range[0] <= c['tm'] <= target_tm_range[1]]
+    
+    if in_range:
+        # 选择Tm最接近目标中心的
+        return min(in_range, key=lambda x: x['tm_diff_from_target'])
+    else:
+        # 没有完全在范围内的，返回最接近的
+        return candidates[0]
 
 
 def evaluate_primer_quality(seq: str, config=None) -> Dict:
@@ -1488,6 +1730,15 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
     # === 第一步：设计ASP引物候选，计算平均Tm用于Common引物匹配 ===
     asp_tm_values = []  # 收集ASP引物Tm值用于计算目标Tm
     
+    # === Tm贪婪延伸优化 (LGC商业设计标准) ===
+    # 如果启用，使用动态延伸算法找到最佳Tm的引物长度
+    asp_target_tm_min = getattr(config, 'ASP_TARGET_TM_MIN', 60.0)
+    asp_target_tm_max = getattr(config, 'ASP_TARGET_TM_MAX', 62.0)
+    use_tm_greedy = getattr(config, 'TM_GREEDY_EXTENSION', True)
+    
+    # 收集所有ASP候选（含Tm信息）用于智能筛选
+    asp_candidates = []
+    
     # 生成不同长度的ASP引物
     for primer_len in range(config.MIN_PRIMER_LEN, min(config.MAX_PRIMER_LEN + 1, len(upstream) + 1)):
         core_seq = upstream[-(primer_len - 1):]
@@ -1541,6 +1792,50 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
             # 收集ASP的Tm用于Common引物设计
             asp_avg_tm = (eval1['tm'] + eval2['tm']) / 2
             asp_tm_values.append(asp_avg_tm)
+            
+            # === Tm贪婪延伸检查 ===
+            # 如果Tm低于目标范围下限，尝试向5'端延伸
+            tm_optimized = False
+            if use_tm_greedy and asp_avg_tm < asp_target_tm_min:
+                # 计算还需要多少Tm提升
+                tm_deficit = asp_target_tm_min - asp_avg_tm
+                
+                # 尝试延伸以达到目标Tm
+                extended_len = primer_len
+                max_extend = min(config.MAX_PRIMER_LEN + 5, len(upstream))  # 允许额外延伸5bp
+                
+                while extended_len < max_extend and asp_avg_tm < asp_target_tm_min:
+                    extended_len += 1
+                    ext_core_seq = upstream[-(extended_len - 1):]
+                    
+                    # 重新应用错配
+                    ext_fwd1, ext_orig1, ext_mis1 = apply_deliberate_mismatch(
+                        ext_core_seq, allele1, mismatch_position=mismatch_pos
+                    )
+                    ext_fwd2, ext_orig2, ext_mis2 = apply_deliberate_mismatch(
+                        ext_core_seq, allele2, mismatch_position=mismatch_pos
+                    )
+                    
+                    if not ext_mis1 or ext_mis1 == ext_orig1:
+                        continue
+                    
+                    # 重新计算Tm
+                    ext_eval1 = evaluate_primer_quality(ext_fwd1, config)
+                    ext_eval2 = evaluate_primer_quality(ext_fwd2, config)
+                    ext_avg_tm = (ext_eval1['tm'] + ext_eval2['tm']) / 2
+                    
+                    # 如果Tm达到目标，使用延伸后的引物
+                    if ext_avg_tm >= asp_target_tm_min - 0.5:
+                        fwd_allele1, fwd_allele2 = ext_fwd1, ext_fwd2
+                        eval1, eval2 = ext_eval1, ext_eval2
+                        orig_base1, mismatch_base1 = ext_orig1, ext_mis1
+                        core_seq = ext_core_seq
+                        asp_avg_tm = ext_avg_tm
+                        asp_tm_diff = abs(eval1['tm'] - eval2['tm'])
+                        fwd_with_fam = config.FAM_TAIL + fwd_allele1
+                        fwd_with_hex = config.HEX_TAIL + fwd_allele2
+                        tm_optimized = True
+                        break
             
             # 用于错配信息记录
             original_base = orig_base1
@@ -1615,6 +1910,11 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
                     # Primer3优化加分
                     total_score += 5
                     
+                    # === Tm贪婪延伸优化加分 ===
+                    # 如果Tm在目标范围内，额外加分
+                    if asp_target_tm_min <= asp_avg_tm <= asp_target_tm_max:
+                        total_score += 8  # Tm达到LGC标准范围
+                    
                     wheat_issues = []
                     wheat_details = {}
                     
@@ -1678,7 +1978,9 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
                         'wheat_issues': wheat_issues,
                         'wheat_details': wheat_details,
                         'primer3_designed': True,
-                        'rescue_mode': _is_rescue_mode
+                        'rescue_mode': _is_rescue_mode,
+                        'tm_greedy_optimized': tm_optimized,  # 标记是否经过Tm贪婪延伸优化
+                        'asp_target_tm_range': (asp_target_tm_min, asp_target_tm_max)
                     }
                     # 在线去重：检查签名是否已存在
                     signature = (fwd_allele1, fwd_allele2, rev_seq, mismatch_pos)
@@ -1819,7 +2121,9 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
                         'wheat_mode': config.WHEAT_MODE,
                         'wheat_issues': wheat_issues,
                         'wheat_details': wheat_details,
-                        'rescue_mode': _is_rescue_mode
+                        'rescue_mode': _is_rescue_mode,
+                        'tm_greedy_optimized': tm_optimized,  # 标记是否经过Tm贪婪延伸优化
+                        'asp_target_tm_range': (asp_target_tm_min, asp_target_tm_max)
                     }
                     # 在线去重：检查签名是否已存在
                     signature = (fwd_allele1, fwd_allele2, rev_seq, mismatch_pos)
@@ -1904,7 +2208,14 @@ def design_kasp_primers_with_diagnosis(upstream: str, downstream: str, allele1: 
          * Tm下限：55°C → 52°C
        - 实现：通过 config.get_rescue_config() 获取放宽的参数
     
-    3. 【智能失败诊断 (Smart Failure Feedback)】
+    3. 【Tm贪婪延伸优化 (Tm Greedy Extension)】 - NEW!
+       - 目标：复现LGC商业设计中"为了获得更好Tm而多取碱基"的行为
+       - 原理：如果ASP引物Tm低于目标范围(60-62°C)，自动向5'端延伸
+       - 实现：optimize_5prime_extension() 和 apply_n3_mismatch() 函数
+       - 配置：TM_GREEDY_EXTENSION=True (默认启用)
+       - 示例：21bp引物Tm=58°C → 延伸到22bp → Tm=60.5°C ✓
+    
+    4. 【智能失败诊断 (Smart Failure Feedback)】
        - 触发：救援模式也失败时
        - 分析内容：
          * GC含量分析（<25%为极低）
