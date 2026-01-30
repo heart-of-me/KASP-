@@ -1,6 +1,6 @@
 """
 KASP & 常规PCR 引物设计工具 - Streamlit Web版
-版本: v6.0 Web (Primer3-py重构版)
+版本: v7.0 Web (Primer3-py重构版)
 功能: KASP引物设计、常规PCR引物设计、质量评估、CSV导出
 重构: 使用primer3-py库进行专业的热力学计算，参考polyoligo-kasp设计理念
 """
@@ -79,6 +79,20 @@ def show_kasp_features_info():
         - **ASP引物**: 只计算核心序列Tm(不含FAM/HEX)
         - **Common引物**: 目标Tm 60-62°C
         - **匹配策略**: Common引物长度可达30bp以匹配ASP的Tm
+        
+        ---
+        
+        ### 4️⃣ 智能失败诊断
+        
+        当救援模式也失败时，自动分析原因：
+        
+        | 诊断项 | 阈值 |
+        |--------|------|
+        | GC极低 | <25% → 建议换SNP |
+        | GC偏低 | <35% → 建议加长引物 |
+        | 发夹风险 | Tm>45°C → 避开区域 |
+        | 重复序列 | SSR/转座子 → 警告 |
+        | 序列过短 | <25bp → 提供更长序列 |
         """)
 
 
@@ -1195,6 +1209,247 @@ def design_kasp_common_primer_with_primer3(downstream: str, config: KASPConfig,
     return candidates
 
 
+# ==================== 智能失败诊断模块 (Smart Failure Feedback) ====================
+
+@dataclass
+class DesignFailureDiagnosis:
+    """引物设计失败诊断结果"""
+    success: bool                      # 是否成功设计
+    failure_reason: str                # 主要失败原因
+    suggestions: List[str]             # 优化建议列表
+    sequence_analysis: Dict            # 序列分析详情
+    severity: str                      # 问题严重程度: 'low', 'medium', 'high', 'critical'
+
+
+def diagnose_design_failure(upstream: str, downstream: str, allele1: str, allele2: str,
+                            config: KASPConfig = None) -> DesignFailureDiagnosis:
+    """
+    智能失败诊断 - 分析为什么引物设计失败并给出具体建议
+    
+    参数:
+        upstream: SNP上游序列
+        downstream: SNP下游序列
+        allele1, allele2: 两个等位基因
+        config: KASP配置
+    
+    返回:
+        DesignFailureDiagnosis 诊断结果对象
+    """
+    if config is None:
+        config = KASPConfig()
+    
+    suggestions = []
+    issues_found = []
+    severity = 'low'
+    
+    # === 1. 分析目标区域 (SNP上下游50bp) ===
+    target_upstream = upstream[-50:] if len(upstream) >= 50 else upstream
+    target_downstream = downstream[:50] if len(downstream) >= 50 else downstream
+    target_region = target_upstream + downstream[:80]  # 引物设计核心区域
+    
+    # === 2. GC含量分析 ===
+    target_gc = calc_gc_content(target_region)
+    upstream_gc = calc_gc_content(target_upstream)
+    downstream_gc = calc_gc_content(target_downstream)
+    
+    gc_issues = []
+    
+    # 极低GC含量检测 (< 25%) - 关键问题
+    if target_gc < 25:
+        gc_issues.append(f"目标区域GC含量极低 ({target_gc:.1f}% < 25%)")
+        issues_found.append("gc_extremely_low")
+        severity = 'critical'
+        suggestions.append("🔴 该位点GC含量极低（<25%），常规引物难以结合，强烈建议重新选择附近的SNP位点")
+        suggestions.append("💡 尝试在该SNP上下游100-200bp范围内寻找GC含量更高的替代SNP")
+    elif target_gc < 30:
+        gc_issues.append(f"目标区域GC含量偏低 ({target_gc:.1f}%)")
+        issues_found.append("gc_low")
+        if severity != 'critical':
+            severity = 'high'
+        suggestions.append("🟠 GC含量偏低，可能导致引物结合力不足")
+        suggestions.append("💡 可尝试增加引物长度(28-32bp)以提高Tm值")
+    
+    # 上游/下游GC不平衡
+    gc_diff = abs(upstream_gc - downstream_gc)
+    if gc_diff > 25:
+        gc_issues.append(f"上下游GC含量差异大 (上游{upstream_gc:.1f}% vs 下游{downstream_gc:.1f}%)")
+        issues_found.append("gc_imbalance")
+        suggestions.append("⚠️ 上下游GC含量差异较大，可能导致ASP和Common引物Tm难以平衡")
+    
+    # === 3. 序列复杂度分析 ===
+    complexity = analyze_sequence_complexity(target_region)
+    
+    if complexity['low_complexity']:
+        issues_found.append("low_complexity")
+        if severity not in ['critical', 'high']:
+            severity = 'medium'
+        suggestions.append("⚠️ 序列含有低复杂度区域（连续重复碱基），可能导致非特异性扩增")
+    
+    if complexity['complexity_score'] < 50:
+        issues_found.append("simple_sequence")
+        suggestions.append("⚠️ 序列复杂度较低，引物可能在基因组中有多个结合位点")
+    
+    # === 4. 发夹结构风险分析 ===
+    # 检查上游序列（ASP引物区域）
+    asp_region = upstream[-30:] if len(upstream) >= 30 else upstream
+    has_hairpin_asp, hairpin_tm_asp = check_hairpin(asp_region)
+    
+    if has_hairpin_asp:
+        issues_found.append("hairpin_risk")
+        if severity not in ['critical']:
+            severity = 'high'
+        suggestions.append(f"🔺 ASP引物区域存在发夹结构风险 (Tm: {hairpin_tm_asp}°C)")
+        suggestions.append("💡 可尝试向5'端延伸引物，避开发夹结构区域")
+    
+    # === 5. 重复序列检测 ===
+    has_repeat, repeat_issues = check_wheat_repeat_sequences(target_region)
+    if has_repeat:
+        issues_found.append("repeat_sequences")
+        if severity not in ['critical', 'high']:
+            severity = 'medium'
+        for issue in repeat_issues:
+            suggestions.append(f"🔁 检测到重复序列特征: {issue}")
+        suggestions.append("💡 该区域可能位于转座子或SSR区域，引物特异性可能受影响")
+    
+    # === 6. 序列长度检查 ===
+    if len(upstream) < 25:
+        issues_found.append("upstream_too_short")
+        severity = 'critical'
+        suggestions.append("🔴 上游序列过短（<25bp），无法设计有效的ASP引物")
+        suggestions.append("💡 请提供更长的上游侧翼序列（建议>50bp）")
+    
+    if len(downstream) < 60:
+        issues_found.append("downstream_too_short")
+        if severity != 'critical':
+            severity = 'high'
+        suggestions.append("🟠 下游序列较短，Common引物设计空间受限")
+        suggestions.append("💡 请提供更长的下游侧翼序列（建议>100bp）")
+    
+    # === 7. SNP类型分析 ===
+    snp_pair = frozenset([allele1.upper(), allele2.upper()])
+    
+    # 转换/颠换分析
+    transitions = [frozenset(['A', 'G']), frozenset(['C', 'T'])]
+    transversions = [frozenset(['A', 'C']), frozenset(['A', 'T']), 
+                     frozenset(['G', 'C']), frozenset(['G', 'T'])]
+    
+    if snp_pair in transitions:
+        snp_type = "转换(Transition)"
+    elif snp_pair in transversions:
+        snp_type = "颠换(Transversion)"
+    else:
+        snp_type = "未知"
+    
+    # AT/AT SNP特别难设计
+    if snp_pair == frozenset(['A', 'T']):
+        issues_found.append("at_snp")
+        suggestions.append("⚠️ A/T SNP的两个等位基因引物Tm差异可能较大")
+    
+    # === 8. 综合诊断 ===
+    sequence_analysis = {
+        'target_gc': target_gc,
+        'upstream_gc': upstream_gc,
+        'downstream_gc': downstream_gc,
+        'gc_difference': gc_diff,
+        'complexity_score': complexity['complexity_score'],
+        'has_low_complexity': complexity['low_complexity'],
+        'has_hairpin': has_hairpin_asp,
+        'hairpin_tm': hairpin_tm_asp,
+        'has_repeat': has_repeat,
+        'upstream_length': len(upstream),
+        'downstream_length': len(downstream),
+        'snp_type': snp_type,
+        'snp_bases': f"[{allele1}/{allele2}]",
+        'issues_found': issues_found
+    }
+    
+    # 生成主要失败原因
+    if 'gc_extremely_low' in issues_found:
+        failure_reason = f"目标区域GC含量极低 ({target_gc:.1f}%)，无法设计出满足Tm要求的引物"
+    elif 'upstream_too_short' in issues_found:
+        failure_reason = "上游序列过短，ASP引物设计空间不足"
+    elif 'gc_low' in issues_found and 'hairpin_risk' in issues_found:
+        failure_reason = "GC含量偏低且存在发夹结构风险，双重限制导致设计失败"
+    elif 'low_complexity' in issues_found or 'repeat_sequences' in issues_found:
+        failure_reason = "该区域序列复杂度低或存在重复序列，引物设计空间受限"
+    elif 'hairpin_risk' in issues_found:
+        failure_reason = "引物结合区域存在强发夹结构，无法找到合适的引物"
+    elif 'gc_low' in issues_found:
+        failure_reason = f"GC含量偏低 ({target_gc:.1f}%)，难以达到目标Tm值"
+    else:
+        failure_reason = "综合因素导致无法找到满足所有条件的引物组合"
+        suggestions.append("💡 尝试放宽Tm范围（如52-65°C）或增加最大引物长度（如35bp）")
+    
+    # 添加通用建议
+    if not suggestions:
+        suggestions = [
+            "💡 检查输入序列是否正确",
+            "💡 尝试提供更长的侧翼序列",
+            "💡 考虑选择附近的替代SNP位点"
+        ]
+    
+    return DesignFailureDiagnosis(
+        success=False,
+        failure_reason=failure_reason,
+        suggestions=suggestions,
+        sequence_analysis=sequence_analysis,
+        severity=severity
+    )
+
+
+def format_diagnosis_for_display(diagnosis: DesignFailureDiagnosis) -> str:
+    """将诊断结果格式化为用户友好的显示文本"""
+    severity_icons = {
+        'critical': '🔴',
+        'high': '🟠',
+        'medium': '🟡',
+        'low': '🟢'
+    }
+    
+    severity_labels = {
+        'critical': '严重',
+        'high': '较高',
+        'medium': '中等',
+        'low': '轻微'
+    }
+    
+    icon = severity_icons.get(diagnosis.severity, '⚪')
+    label = severity_labels.get(diagnosis.severity, '未知')
+    
+    output = f"""
+### {icon} 设计失败诊断报告
+
+**问题严重程度**: {label}
+
+**主要原因**: {diagnosis.failure_reason}
+
+---
+
+#### 📊 序列分析结果
+
+| 指标 | 数值 | 状态 |
+|------|------|------|
+| 目标区域GC% | {diagnosis.sequence_analysis['target_gc']:.1f}% | {'⚠️ 偏低' if diagnosis.sequence_analysis['target_gc'] < 35 else '✓ 正常'} |
+| 上游序列GC% | {diagnosis.sequence_analysis['upstream_gc']:.1f}% | {'⚠️' if diagnosis.sequence_analysis['upstream_gc'] < 30 else '✓'} |
+| 下游序列GC% | {diagnosis.sequence_analysis['downstream_gc']:.1f}% | {'⚠️' if diagnosis.sequence_analysis['downstream_gc'] < 30 else '✓'} |
+| 序列复杂度 | {diagnosis.sequence_analysis['complexity_score']:.0f}/100 | {'⚠️ 偏低' if diagnosis.sequence_analysis['complexity_score'] < 60 else '✓ 正常'} |
+| 发夹结构风险 | {'是' if diagnosis.sequence_analysis['has_hairpin'] else '否'} | {'⚠️' if diagnosis.sequence_analysis['has_hairpin'] else '✓'} |
+| 重复序列 | {'检测到' if diagnosis.sequence_analysis['has_repeat'] else '未检测到'} | {'⚠️' if diagnosis.sequence_analysis['has_repeat'] else '✓'} |
+| 上游序列长度 | {diagnosis.sequence_analysis['upstream_length']}bp | {'⚠️ 过短' if diagnosis.sequence_analysis['upstream_length'] < 30 else '✓'} |
+| 下游序列长度 | {diagnosis.sequence_analysis['downstream_length']}bp | {'⚠️ 过短' if diagnosis.sequence_analysis['downstream_length'] < 80 else '✓'} |
+| SNP类型 | {diagnosis.sequence_analysis['snp_type']} {diagnosis.sequence_analysis['snp_bases']} | - |
+
+---
+
+#### 💡 优化建议
+
+"""
+    for i, suggestion in enumerate(diagnosis.suggestions, 1):
+        output += f"{i}. {suggestion}\n"
+    
+    return output
+
+
 def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, allele2: str, 
                               config: KASPConfig = None, num_schemes: int = 5,
                               _is_rescue_mode: bool = False) -> List[Dict]:
@@ -1579,7 +1834,7 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
                 scheme['rescue_note'] = "⚠️ 该引物由救援模式设计（放宽参数），建议优先考虑标准模式引物"
             return rescue_schemes
     
-    # 如果没有找到任何方案，返回空列表
+    # === 如果救援模式也失败，返回空列表（诊断在外层处理）===
     if not all_schemes:
         return []
     
@@ -1610,6 +1865,72 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
             break
     
     return unique_schemes
+
+
+def design_kasp_primers_with_diagnosis(upstream: str, downstream: str, allele1: str, allele2: str,
+                                        config: KASPConfig = None, num_schemes: int = 5) -> Tuple[List[Dict], Optional[DesignFailureDiagnosis]]:
+    """
+    KASP引物设计主入口函数 - 带智能失败诊断
+    
+    这是推荐使用的设计函数，会在设计失败时自动进行序列诊断并返回详细建议。
+    
+    ==================== 核心功能说明 ====================
+    
+    1. 【LGC标准人工错配 (n-3 Deliberate Mismatch)】
+       - 位置：在ASP引物3'端倒数第3位引入人工错配
+       - 实现：通过 apply_deliberate_mismatch() 函数
+       - 规则：根据SNP强度(G/C为强, A/T为弱)选择最佳destabilizing错配
+       - 作用：增强等位基因特异性，减少非特异性扩增
+    
+    2. 【救援模式 (Rescue Mode)】
+       - 触发：标准参数无法设计出引物时自动启用
+       - 参数调整：
+         * 最大引物长度：25bp → 32bp
+         * GC下限：35% → 20%  
+         * Tm下限：55°C → 52°C
+       - 实现：通过 config.get_rescue_config() 获取放宽的参数
+    
+    3. 【智能失败诊断 (Smart Failure Feedback)】
+       - 触发：救援模式也失败时
+       - 分析内容：
+         * GC含量分析（<25%为极低）
+         * 序列复杂度评估
+         * 发夹结构风险
+         * 重复序列检测
+       - 输出：具体失败原因和优化建议
+    
+    =====================================================
+    
+    参数:
+        upstream: SNP上游序列
+        downstream: SNP下游序列
+        allele1, allele2: 两个等位基因碱基
+        config: KASP配置参数
+        num_schemes: 需要返回的方案数
+    
+    返回:
+        (schemes, diagnosis): 
+            - schemes: 引物方案列表，失败时为空列表
+            - diagnosis: 失败诊断结果，成功时为None
+    """
+    if config is None:
+        config = KASPConfig()
+    
+    # 调用核心设计函数
+    schemes = design_kasp_primers_multi(
+        upstream, downstream, allele1, allele2,
+        config=config,
+        num_schemes=num_schemes
+    )
+    
+    # 如果设计成功，返回结果
+    if schemes:
+        return schemes, None
+    
+    # === 设计失败，进行智能诊断 ===
+    diagnosis = diagnose_design_failure(upstream, downstream, allele1, allele2, config)
+    
+    return [], diagnosis
 
 
 # ==================== 常规PCR引物设计 ====================
@@ -2701,10 +3022,38 @@ GGAGACCCGCAAGGCGCTCGGATCGGCTTACCACTCCATGATGATGGTGGAGCAGGTCCACCTGGGGAAGAGCGCCAACT
                     config.REV_MIN_DISTANCE = 30
                     config.REV_MAX_DISTANCE = 80
                 
-                schemes = design_kasp_primers_multi(upstream, downstream, allele1, allele2, config, num_schemes)
+                # === 使用带智能诊断的设计函数 ===
+                # 核心设计流程说明:
+                # 1. 首先尝试标准模式设计（含n-3人工错配）
+                # 2. 如果失败，自动启用救援模式（放宽参数）
+                # 3. 如果救援模式也失败，进行智能诊断
+                schemes, diagnosis = design_kasp_primers_with_diagnosis(
+                    upstream, downstream, allele1, allele2, config, num_schemes
+                )
             
+            # === 智能失败诊断显示 ===
             if not schemes:
-                st.error("❌ 未能设计出合适的引物，请检查序列或调整参数")
+                st.error("❌ 未能设计出合适的引物")
+                
+                # 显示详细诊断信息
+                if diagnosis:
+                    # 根据严重程度选择颜色
+                    if diagnosis.severity == 'critical':
+                        st.error(f"🔴 **主要原因**: {diagnosis.failure_reason}")
+                    elif diagnosis.severity == 'high':
+                        st.warning(f"🟠 **主要原因**: {diagnosis.failure_reason}")
+                    else:
+                        st.info(f"🟡 **主要原因**: {diagnosis.failure_reason}")
+                    
+                    # 显示格式化的诊断报告
+                    st.markdown(format_diagnosis_for_display(diagnosis))
+                    
+                    # 可折叠的详细数据
+                    with st.expander("📋 查看原始诊断数据"):
+                        st.json(diagnosis.sequence_analysis)
+                else:
+                    st.warning("未能获取详细诊断信息，请检查输入序列格式")
+                
                 return
             
             st.success(f"✅ 成功设计 {len(schemes)} 套引物方案！")
@@ -4054,27 +4403,34 @@ def main():
         st.markdown("---")
         st.markdown("### ✨ v7.0 新功能亮点")
         
-        feat_col1, feat_col2, feat_col3 = st.columns(3)
+        feat_col1, feat_col2, feat_col3, feat_col4 = st.columns(4)
         
         with feat_col1:
             st.info("""
             **🔬 LGC人工错配**
             
-            在ASP引物n-3位置引入deliberate mismatch，根据SNP强度选择最佳错配碱基，显著增强等位基因特异性。
+            在ASP引物n-3位置引入deliberate mismatch，根据SNP强度选择最佳错配碱基。
             """)
         
         with feat_col2:
             st.info("""
             **🆘 救援模式**
             
-            自动检测AT-rich序列，放宽参数（长度32bp、GC 20%）确保设计成功，告别空结果。
+            自动检测AT-rich序列，放宽参数确保设计成功，告别空结果。
             """)
         
         with feat_col3:
             st.info("""
             **⚖️ Tm平衡**
             
-            Common引物智能匹配ASP的Tm值(目标60-62°C)，可延长至30bp，确保PCR效率均衡。
+            Common引物智能匹配ASP的Tm值，确保PCR效率均衡。
+            """)
+        
+        with feat_col4:
+            st.info("""
+            **🔍 智能诊断**
+            
+            设计失败时自动分析原因（GC、发夹、复杂度），给出具体建议。
             """)
         
         st.markdown("---")
