@@ -24,7 +24,7 @@ except ImportError:
 
 # ==================== 页面配置 ====================
 st.set_page_config(
-    page_title="引物设计工具 v6.0",
+    page_title="引物设计工具 v7.0",
     page_icon="🧬",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -1844,26 +1844,32 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
     else:
         all_schemes.sort(key=lambda x: x['total_score'], reverse=True)
     
-    # 严格去重：确保每个方案的引物组合都是唯一的
+    # === 严格去重：确保每个方案的引物组合都是唯一的 ===
+    # 使用多重去重策略，避免重复方案
     unique_schemes = []
-    seen_cores = set()  # 核心序列组合
-    seen_full = set()   # 完整引物组合
+    seen_signatures = set()  # 使用更全面的签名
     
     for scheme in all_schemes:
-        # 多重去重检查
-        core_key = (scheme['fwd_allele1_core'], scheme['reverse'])
-        full_key = (scheme['fwd_allele1_full'], scheme['fwd_allele2_full'], scheme['reverse'])
+        # 生成唯一签名：核心序列 + 反向引物 + 错配位置
+        signature = (
+            scheme['fwd_allele1_core'],
+            scheme['fwd_allele2_core'],
+            scheme['reverse'],
+            scheme['mismatch_pos']
+        )
         
-        if core_key in seen_cores or full_key in seen_full:
+        # 如果已经见过这个签名，跳过
+        if signature in seen_signatures:
             continue
         
-        seen_cores.add(core_key)
-        seen_full.add(full_key)
+        seen_signatures.add(signature)
         unique_schemes.append(scheme)
         
+        # 只收集需要的数量，不强制填充
         if len(unique_schemes) >= num_schemes:
             break
     
+    # 返回实际设计出的独特方案（可能少于 num_schemes）
     return unique_schemes
 
 
@@ -3056,7 +3062,13 @@ GGAGACCCGCAAGGCGCTCGGATCGGCTTACCACTCCATGATGATGGTGGAGCAGGTCCACCTGGGGAAGAGCGCCAACT
                 
                 return
             
-            st.success(f"✅ 成功设计 {len(schemes)} 套引物方案！")
+            # 显示实际设计出的方案数量
+            actual_count = len(schemes)
+            if actual_count < num_schemes:
+                st.success(f"✅ 成功设计 {actual_count} 套独特引物方案（已去除重复方案）")
+                st.info(f"ℹ️ 由于序列特性限制，实际可设计的独特方案少于请求的 {num_schemes} 套")
+            else:
+                st.success(f"✅ 成功设计 {actual_count} 套引物方案！")
             
             # 小麦模式警告
             if wheat_mode:
