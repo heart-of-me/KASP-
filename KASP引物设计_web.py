@@ -1483,6 +1483,7 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
         return []  # 下游序列太短
     
     all_schemes = []
+    seen_signatures = set()  # 在线去重：记录已添加的方案签名
     
     # === 第一步：设计ASP引物候选，计算平均Tm用于Common引物匹配 ===
     asp_tm_values = []  # 收集ASP引物Tm值用于计算目标Tm
@@ -1679,7 +1680,11 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
                         'primer3_designed': True,
                         'rescue_mode': _is_rescue_mode
                     }
-                    all_schemes.append(scheme)
+                    # 在线去重：检查签名是否已存在
+                    signature = (fwd_allele1, fwd_allele2, rev_seq, mismatch_pos)
+                    if signature not in seen_signatures:
+                        seen_signatures.add(signature)
+                        all_schemes.append(scheme)
             
             # === 回退：手动搜索反向引物 ===
             common_max_len = getattr(config, 'COMMON_MAX_LEN', config.MAX_PRIMER_LEN)
@@ -1816,7 +1821,11 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
                         'wheat_details': wheat_details,
                         'rescue_mode': _is_rescue_mode
                     }
-                    all_schemes.append(scheme)
+                    # 在线去重：检查签名是否已存在
+                    signature = (fwd_allele1, fwd_allele2, rev_seq, mismatch_pos)
+                    if signature not in seen_signatures:
+                        seen_signatures.add(signature)
+                        all_schemes.append(scheme)
     
     # === 救援模式：如果标准模式没有找到方案，启用救援模式 ===
     if not all_schemes and config.RESCUE_MODE_ENABLED and not _is_rescue_mode:
@@ -1844,10 +1853,9 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
     else:
         all_schemes.sort(key=lambda x: x['total_score'], reverse=True)
     
-    # === 严格去重：确保每个方案的引物组合都是唯一的 ===
-    # 使用多重去重策略，避免重复方案
+    # === 最终去重（双重保险）：确保返回的方案都是唯一的 ===
     unique_schemes = []
-    seen_signatures = set()  # 使用更全面的签名
+    final_signatures = set()
     
     for scheme in all_schemes:
         # 生成唯一签名：核心序列 + 反向引物 + 错配位置
@@ -1859,10 +1867,10 @@ def design_kasp_primers_multi(upstream: str, downstream: str, allele1: str, alle
         )
         
         # 如果已经见过这个签名，跳过
-        if signature in seen_signatures:
+        if signature in final_signatures:
             continue
         
-        seen_signatures.add(signature)
+        final_signatures.add(signature)
         unique_schemes.append(scheme)
         
         # 只收集需要的数量，不强制填充
