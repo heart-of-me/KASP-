@@ -4452,16 +4452,34 @@ def show_primer_analysis():
                 st.error("❌ 引物序列过短（<10bp），无法进行有效分析")
                 return
             
-            # 根据类型选择配置
-            if primer_type == "KASP Allele" or primer_type == "KASP Common":
+            # 根据类型选择配置和Tm计算参数
+            selected_type = primer_type_options[primer_type]
+            if selected_type in ("KASP Allele", "KASP Common"):
                 config = KASPConfig()
                 config.WHEAT_MODE = check_wheat
+                # KASP使用特定盐浓度
+                tm_value = calc_tm(primer, mv_conc=THERMO_PARAMS.kasp_mv_conc,
+                                   dv_conc=THERMO_PARAMS.kasp_dv_conc,
+                                   dntp_conc=THERMO_PARAMS.kasp_dntp_conc,
+                                   dna_conc=THERMO_PARAMS.kasp_dna_conc)
+                # KASP引物Tm参考范围
+                if selected_type == "KASP Allele":
+                    tm_optimal_low, tm_optimal_high = 60.0, 62.0
+                    tm_accept_low, tm_accept_high = 55.0, 68.0
+                else:  # KASP Common
+                    tm_optimal_low, tm_optimal_high = 60.0, 63.0
+                    tm_accept_low, tm_accept_high = 57.0, 68.0
             else:
                 config = RegularPCRConfig()
                 config.WHEAT_MODE = check_wheat
+                tm_value = calc_tm(primer)
+                tm_optimal_low, tm_optimal_high = 58.0, 62.0
+                tm_accept_low, tm_accept_high = 55.0, 68.0
             
             # 基础分析
             result = evaluate_primer_quality(primer, config)
+            # 用类型特定的Tm值覆盖
+            result['tm'] = tm_value
             grade, stars, css_class = get_quality_grade(result['score'])
             
             # 显示结果
@@ -4471,23 +4489,26 @@ def show_primer_analysis():
             
             # 引物信息
             st.code(f"5'- {primer} -3'")
-            st.caption(f"长度: {len(primer)} bp")
+            type_label = selected_type
+            tm_method = "Primer3 SantaLucia" if PRIMER3_AVAILABLE else "内置最近邻法"
+            st.caption(f"长度: {len(primer)} bp | 类型: {type_label} | Tm算法: {tm_method}")
             
             # 指标展示
             col1, col2, col3, col4, col5 = st.columns(5)
             
             with col1:
-                tm_color = "🟢" if 58 <= result['tm'] <= 62 else ("🟡" if 55 <= result['tm'] <= 68 else "🔴")
-                st.metric("Tm值", f"{result['tm']}°C", delta=f"{tm_color}")
+                tm_color = "🟢" if tm_optimal_low <= result['tm'] <= tm_optimal_high else ("🟡" if tm_accept_low <= result['tm'] <= tm_accept_high else "🔴")
+                tm_range_text = f"{tm_optimal_low:.0f}-{tm_optimal_high:.0f}°C"
+                st.metric("Tm值", f"{result['tm']}°C", delta=f"{tm_color} 最优{tm_range_text}")
             
             with col2:
                 gc = result['gc_content']
-                gc_color = "🟢" if 40 <= gc <= 60 else ("🟡" if 30 <= gc <= 70 else "🔴")
-                st.metric("GC含量", f"{gc:.1f}%", delta=f"{gc_color}")
+                gc_color = "🟢" if config.OPTIMAL_GC_MIN <= gc <= config.OPTIMAL_GC_MAX else ("🟡" if config.MIN_GC <= gc <= config.MAX_GC else "🔴")
+                st.metric("GC含量", f"{gc:.1f}%", delta=f"{gc_color} 最优{config.OPTIMAL_GC_MIN:.0f}-{config.OPTIMAL_GC_MAX:.0f}%")
             
             with col3:
-                len_color = "🟢" if 18 <= len(primer) <= 25 else ("🟡" if 15 <= len(primer) <= 30 else "🔴")
-                st.metric("长度", f"{len(primer)}bp", delta=f"{len_color}")
+                len_color = "🟢" if config.MIN_PRIMER_LEN <= len(primer) <= config.MAX_PRIMER_LEN else ("🟡" if 15 <= len(primer) <= 35 else "🔴")
+                st.metric("长度", f"{len(primer)}bp", delta=f"{len_color} 推荐{config.MIN_PRIMER_LEN}-{config.MAX_PRIMER_LEN}bp")
             
             with col4:
                 end_base = primer[-1]
@@ -4506,17 +4527,25 @@ def show_primer_analysis():
                 hairpin_status = "❌ 检测到" if result['has_hairpin'] else "✅ 未检测到"
                 st.write(f"**发夹结构:** {hairpin_status}")
                 if result['has_hairpin']:
-                    st.caption("⚠️ 可能影响引物特异性和扩增效率")
+                    if result.get('hairpin_tm') is not None:
+                        st.caption(f"⚠️ 发夹Tm={result['hairpin_tm']:.1f}°C，可能影响引物退火效率")
+                    else:
+                        st.caption("⚠️ 可能影响引物特异性和扩增效率")
                 
                 dimer_status = "❌ 有风险" if result['has_self_dimer'] else "✅ 无风险"
                 st.write(f"**自身二聚体:** {dimer_status}")
                 if result['has_self_dimer']:
-                    st.caption("⚠️ 可能导致引物-引物扩增")
+                    if result.get('homodimer_dg') is not None:
+                        st.caption(f"⚠️ ΔG={result['homodimer_dg']:.1f} kcal/mol，可能导致引物-引物扩增")
+                    else:
+                        st.caption("⚠️ 可能导致引物-引物扩增")
                 
                 # 检查重复
                 has_repeat = check_repeat_region(primer)
                 repeat_status = "❌ 检测到" if has_repeat else "✅ 无"
                 st.write(f"**重复序列:** {repeat_status}")
+                if has_repeat:
+                    st.caption("⚠️ 连续重复碱基可能导致滑移和非特异性扩增")
             
             with col_b:
                 st.markdown("**🎯 3'端分析**")
@@ -4528,11 +4557,18 @@ def show_primer_analysis():
                 st.write(f"**3'端5bp:** `{end_5}` (GC={gc_end}/5)")
                 
                 if gc_end > 3:
-                    st.caption("⚠️ 3'端GC过多，可能非特异性结合")
+                    st.caption("⚠️ 3'端GC过多（>3/5），可能导致非特异性结合")
                 elif gc_end < 1:
-                    st.caption("⚠️ 3'端GC过少，结合不稳定")
+                    st.caption("⚠️ 3'端无GC碱基，引物结合不稳定")
                 else:
-                    st.caption("✓ 3'端GC含量良好")
+                    st.caption("✓ 3'端GC含量良好（1-3/5），有适当的GC钳夹效应")
+                
+                # 5'端分析
+                st.write(f"**5'端碱基:** `{primer[:3]}...`")
+                if primer[0] in ['G', 'C']:
+                    st.caption("✓ 5'端以G/C起始，协助稳定引物结合")
+                else:
+                    st.caption("ℹ️ 5'端以A/T起始，对功能无显著影响")
             
             # 小麦特异性分析
             if check_wheat:
@@ -4554,18 +4590,18 @@ def show_primer_analysis():
                 if gc_extreme:
                     st.error(f"❌ {gc_msg}")
                 else:
-                    st.success(f"✅ GC含量符合小麦KASP标准")
+                    st.success(f"✅ GC含量符合小麦KASP标准 ({gc_val:.1f}%)")
                 
                 # 序列复杂度
                 complexity = analyze_sequence_complexity(primer)
                 complexity_score = complexity['complexity_score']
                 
                 if complexity_score >= 75:
-                    st.success(f"✅ 序列复杂度高 ({complexity_score:.0f}/100) - 特异性好")
+                    st.success(f"✅ 序列复杂度高 ({complexity_score:.0f}/100) - 利于在A/B/D基因组间区分")
                 elif complexity_score >= 60:
-                    st.info(f"ℹ️ 序列复杂度中等 ({complexity_score:.0f}/100)")
+                    st.info(f"ℹ️ 序列复杂度中等 ({complexity_score:.0f}/100) - 建议BLAST验证特异性")
                 else:
-                    st.warning(f"⚠️ 序列复杂度低 ({complexity_score:.0f}/100) - 可能多位点匹配")
+                    st.warning(f"⚠️ 序列复杂度低 ({complexity_score:.0f}/100) - 极可能匹配多个同源位点")
             
             # 问题汇总
             if result['issues']:
@@ -4574,41 +4610,79 @@ def show_primer_analysis():
                 for issue in result['issues']:
                     st.write(f"• {issue}")
             
-            # 优化建议
+            # 优化建议 - 根据引物类型给出针对性建议
             st.markdown("---")
             st.markdown("**💡 优化建议**")
             suggestions = []
             
-            if result['tm'] < 55:
-                suggestions.append("增加引物长度或提高GC含量以提升Tm值")
-            elif result['tm'] > 68:
-                suggestions.append("缩短引物或降低GC含量以降低Tm值")
+            if result['tm'] < tm_accept_low:
+                delta = tm_optimal_low - result['tm']
+                est_bp = max(1, int(delta / 1.5))  # 大约每增加1bp Tm升高1-2°C
+                suggestions.append(f"Tm偏低({result['tm']}°C)，建议向5'端延伸约{est_bp}bp以提升Tm至{tm_optimal_low}-{tm_optimal_high}°C")
+            elif result['tm'] > tm_accept_high:
+                delta = result['tm'] - tm_optimal_high
+                est_bp = max(1, int(delta / 1.5))
+                suggestions.append(f"Tm偏高({result['tm']}°C)，建议从5'端缩短约{est_bp}bp以降低Tm至{tm_optimal_low}-{tm_optimal_high}°C")
+            elif result['tm'] < tm_optimal_low:
+                suggestions.append(f"Tm略低({result['tm']}°C)，接近最优范围{tm_optimal_low}-{tm_optimal_high}°C，可尝试延伸1-2bp")
+            elif result['tm'] > tm_optimal_high:
+                suggestions.append(f"Tm略高({result['tm']}°C)，接近最优范围{tm_optimal_low}-{tm_optimal_high}°C，可尝试缩短1-2bp")
             
-            if result['gc_content'] < 40:
-                suggestions.append("选择GC含量更高的区域设计引物")
-            elif result['gc_content'] > 60:
-                suggestions.append("选择GC含量更适中的区域设计引物")
+            if result['gc_content'] < config.MIN_GC:
+                suggestions.append(f"GC含量过低({result['gc_content']:.1f}%)，选择富含GC的区域重新设计，或向GC丰富的方向延伸引物")
+            elif result['gc_content'] > config.MAX_GC:
+                suggestions.append(f"GC含量过高({result['gc_content']:.1f}%)，高GC引物易形成二级结构，建议添加DMSO(3-5%)或甜菜碱(1M)助溶")
             
             if result['has_hairpin']:
-                suggestions.append("改变引物位置或长度以避免发夹结构")
+                suggestions.append("检测到发夹结构风险: 尝试缩短/延伸引物以打破回文互补区域，或调整引物结合位点")
             
             if result['has_self_dimer']:
-                suggestions.append("调整引物序列以减少自身互补区域")
+                suggestions.append("检测到自身二聚体风险: 检查引物内部是否有较长的自互补序列，必要时重新设计")
             
             if not result['three_prime_ok']:
-                suggestions.append("调整引物使3'端有1-2个G或C")
+                end_5 = primer[-5:]
+                gc_end = end_5.count('G') + end_5.count('C')
+                if gc_end > 3:
+                    suggestions.append("3'端GC过多: 缩短引物1-2bp使3'端GC降至2-3个，防止非特异性延伸")
+                elif gc_end < 1:
+                    suggestions.append("3'端缺少GC: 延伸引物至包含GC碱基处，确保3'端有当的GC钳夹")
+                else:
+                    suggestions.append("调整引物使3'端最后2个碱基中有1个G或C")
             
-            if check_wheat and has_wheat_repeat:
-                suggestions.append("更换设计区域，避开重复序列/转座子区域")
+            if has_repeat:
+                suggestions.append("含连续重复碱基(≥4bp): 模板该区域可能引起聚合酶滑移，建议调整引物位置避开重复区")
+            
+            # 类型特异性建议
+            if selected_type == "KASP Allele":
+                if result['tm'] < 60 or result['tm'] > 62:
+                    suggestions.append(f"KASP ASP引物最优Tm为60-62°C（LGC标准），当前{result['tm']}°C，建议调整引物长度达到目标范围")
+                if len(primer) > 30:
+                    suggestions.append("KASP ASP引物过长(>30bp)可能降低等位基因区分效率，建议控制在20-25bp")
+            elif selected_type == "KASP Common":
+                if result['tm'] < 60 or result['tm'] > 63:
+                    suggestions.append(f"KASP Common引物目标Tm为60-63°C，当前{result['tm']}°C，需与ASP引物Tm匹配")
+            
+            if check_wheat:
+                if has_wheat_repeat:
+                    suggestions.append("小麦基因组含大量重复序列(>85%)，当前引物含重复元件特征，强烈建议更换设计区域")
+                complexity = analyze_sequence_complexity(primer)
+                if complexity['complexity_score'] < 60:
+                    suggestions.append("引物序列复杂度低，在六倍体小麦中可能匹配A/B/D三个基因组，需用BLAST或PolyMarker验证特异性")
             
             if suggestions:
                 for i, sug in enumerate(suggestions, 1):
                     st.write(f"{i}. {sug}")
             else:
-                st.success("✅ 引物质量良好，无需优化")
+                st.success("✅ 引物质量良好，各项指标均在最优范围内，无需优化")
     
-    elif analysis_mode == "引物对分析":
-        st.markdown("#### 📝 输入引物对序列")
+    elif analysis_modes[analysis_mode] == "引物对分析":
+        st.markdown("#### 🧪 常规PCR引物对分析")
+        st.markdown("""
+        <div class="info-box">
+        <b>适用于：</b>常规PCR、RT-qPCR、克隆PCR等双引物体系<br>
+        <b>分析内容：</b>引物参数对比、Tm匹配度、互补二聚体检测、3'端交叉互补、退火温度优化
+        </div>
+        """, unsafe_allow_html=True)
         
         # 检测是否有引物对临时输入
         has_temp_pair_input = st.session_state.get('temp_primer1_input') and st.session_state.get('temp_primer2_input')
@@ -4653,6 +4727,9 @@ def show_primer_analysis():
             # 自动保存
             st.session_state['temp_primer2_name'] = rev_name
         
+        # 可选的预估产物大小
+        product_size_input = st.number_input("预估产物大小 (bp，可选，输入0跳过)", min_value=0, max_value=10000, value=0, step=50, key="pair_product_size")
+        
         if st.button("🔍 分析引物对", type="primary"):
             if not fwd_input or not rev_input:
                 st.warning("请输入两条引物序列")
@@ -4672,99 +4749,233 @@ def show_primer_analysis():
             
             # 引物对分析
             tm_diff = abs(fwd_result['tm'] - rev_result['tm'])
-            has_dimer = check_primer_dimer(fwd, rev)
             
-            # 综合评分
+            # 使用Primer3进行详细的异源二聚体分析
+            has_dimer, dimer_dg, dimer_tm = check_heterodimer(fwd, rev)
+            
+            # 3'端交叉互补检测
+            fwd_3end = fwd[-6:]
+            rev_3end = rev[-6:]
+            rev_rc_3end = reverse_complement(rev_3end)
+            fwd_rc_3end = reverse_complement(fwd_3end)
+            end_cross_complementary = False
+            cross_detail = ""
+            # 检查正向引物3'端与反向引物3'端是否互补
+            for i in range(len(fwd_3end) - 2):
+                seg = fwd_3end[i:i+3]
+                if seg in rev_rc_3end:
+                    end_cross_complementary = True
+                    cross_detail = f"F-3'端 `{fwd_3end}` 与 R-3'端反向互补 `{rev_rc_3end}` 有{len(seg)}bp匹配"
+                    break
+            
+            # GC含量比较
+            gc_diff = abs(fwd_result['gc_content'] - rev_result['gc_content'])
+            
+            # 综合评分（更精确的评分逻辑）
             pair_score = (fwd_result['score'] + rev_result['score']) / 2
+            # Tm匹配评分
             if tm_diff <= 1.0:
                 pair_score += 10
             elif tm_diff <= 2.0:
                 pair_score += 5
+            elif tm_diff <= 3.0:
+                pair_score -= 5
+            elif tm_diff <= 5.0:
+                pair_score -= 15
             else:
-                pair_score -= 10
+                pair_score -= 25
             
+            # 二聚体评分
             if has_dimer:
                 pair_score -= 15
+            if end_cross_complementary:
+                pair_score -= 10  # 3'端交叉互补更严重
+            
+            # GC差异评分
+            if gc_diff > 15:
+                pair_score -= 5
             
             pair_score = max(0, min(100, pair_score))
             grade, stars, css_class = get_quality_grade(pair_score)
             
-            # 显示结果
+            # ---- 显示结果 ----
             st.markdown("---")
-            st.markdown(f"### 📊 引物对分析报告")
+            st.markdown(f"### 📊 PCR引物对综合分析报告")
             st.markdown(f"<h3 style='text-align:center;'><span class='{css_class}'>综合评分: {grade} {stars} ({pair_score:.1f}分)</span></h3>", unsafe_allow_html=True)
             
-            # 两条引物对比
-            col_a, col_b = st.columns(2)
+            # === 第一部分：引物参数对比表 ===
+            st.markdown("#### 📋 引物参数对比")
+            compare_data = {
+                "参数": ["序列 (5'→3')", "长度(bp)", "Tm(°C)", "GC(%)", "3'端碱基", "发夹", "自身二聚体", "重复序列", "3'端稳定性", "单项评分"],
+                fwd_name: [
+                    fwd, len(fwd), f"{fwd_result['tm']}", f"{fwd_result['gc_content']:.1f}",
+                    fwd[-1], "❌" if fwd_result['has_hairpin'] else "✅",
+                    "❌" if fwd_result['has_self_dimer'] else "✅",
+                    "❌" if fwd_result.get('has_repeat') else "✅",
+                    "✅" if fwd_result['three_prime_ok'] else "❌",
+                    f"{fwd_result['score']:.0f}"
+                ],
+                rev_name: [
+                    rev, len(rev), f"{rev_result['tm']}", f"{rev_result['gc_content']:.1f}",
+                    rev[-1], "❌" if rev_result['has_hairpin'] else "✅",
+                    "❌" if rev_result['has_self_dimer'] else "✅",
+                    "❌" if rev_result.get('has_repeat') else "✅",
+                    "✅" if rev_result['three_prime_ok'] else "❌",
+                    f"{rev_result['score']:.0f}"
+                ],
+                "评价": [
+                    "", "✅" if (18 <= len(fwd) <= 25 and 18 <= len(rev) <= 25) else "⚠️",
+                    ("✅ 差异≤1°C" if tm_diff <= 1 else "⚠️ 差异≤2°C" if tm_diff <= 2 else f"❌ 差异{tm_diff:.1f}°C"),
+                    ("✅" if gc_diff <= 10 else f"⚠️ 差异{gc_diff:.0f}%"),
+                    "", "", "", "", "", ""
+                ]
+            }
+            # 简化表格展示
+            st.markdown(f"|  | **{fwd_name}** | **{rev_name}** | **评价** |")
+            st.markdown("|--|--|--|--|")
+            for i, param in enumerate(compare_data["参数"]):
+                if param == "序列 (5'→3')":
+                    st.markdown(f"| {param} | `{compare_data[fwd_name][i]}` | `{compare_data[rev_name][i]}` | {compare_data['评价'][i]} |")
+                else:
+                    st.markdown(f"| {param} | {compare_data[fwd_name][i]} | {compare_data[rev_name][i]} | {compare_data['评价'][i]} |")
             
-            with col_a:
-                st.markdown(f"**正向引物: {fwd_name}**")
-                st.code(f"5'- {fwd} -3'")
-                fwd_grade, fwd_stars, _ = get_quality_grade(fwd_result['score'])
-                st.caption(f"评分: {fwd_result['score']:.0f} ({fwd_grade} {fwd_stars})")
-                
-                st.write(f"**长度:** {len(fwd)} bp")
-                st.write(f"**Tm:** {fwd_result['tm']}°C")
-                st.write(f"**GC:** {fwd_result['gc_content']:.1f}%")
-                
-                if fwd_result['issues']:
-                    st.warning("问题: " + ", ".join(fwd_result['issues'][:2]))
-            
-            with col_b:
-                st.markdown(f"**反向引物: {rev_name}**")
-                st.code(f"5'- {rev} -3'")
-                rev_grade, rev_stars, _ = get_quality_grade(rev_result['score'])
-                st.caption(f"评分: {rev_result['score']:.0f} ({rev_grade} {rev_stars})")
-                
-                st.write(f"**长度:** {len(rev)} bp")
-                st.write(f"**Tm:** {rev_result['tm']}°C")
-                st.write(f"**GC:** {rev_result['gc_content']:.1f}%")
-                
-                if rev_result['issues']:
-                    st.warning("问题: " + ", ".join(rev_result['issues'][:2]))
-            
-            # 配对分析
+            # === 第二部分：配对兼容性分析 ===
             st.markdown("---")
-            st.markdown("**🔗 配对分析**")
+            st.markdown("#### 🔗 配对兼容性分析")
             
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
             
             with col1:
-                tm_status = "✅ 优秀" if tm_diff <= 1.0 else ("⚠️ 可接受" if tm_diff <= 2.0 else "❌ 过大")
+                tm_status = "✅ 优秀(≤1°C)" if tm_diff <= 1.0 else ("🟡 可接受(≤2°C)" if tm_diff <= 2.0 else ("⚠️ 偏大(≤5°C)" if tm_diff <= 5.0 else "❌ 过大(>5°C)"))
                 st.metric("Tm差异", f"{tm_diff:.1f}°C", delta=tm_status)
             
             with col2:
-                dimer_status = "❌ 检测到" if has_dimer else "✅ 无风险"
-                st.metric("引物二聚体", dimer_status)
+                if has_dimer:
+                    dimer_text = f"❌ ΔG={dimer_dg:.1f}" if dimer_dg is not None else "❌ 有风险"
+                else:
+                    dimer_text = "✅ 无风险"
+                st.metric("异源二聚体", dimer_text)
             
             with col3:
+                end_cross = "❌ 检测到" if end_cross_complementary else "✅ 无"
+                st.metric("3'端交叉互补", end_cross)
+            
+            with col4:
                 avg_tm = (fwd_result['tm'] + rev_result['tm']) / 2
                 st.metric("平均Tm", f"{avg_tm:.1f}°C")
             
             # 详细说明
             if has_dimer:
-                st.error("""**❌ 检测到引物二聚体风险**
-- 两条引物之间可能形成互补配对
-- 可能导致引物-引物扩增而非目标扩增
-- 建议：更改其中一条引物的序列""")
+                dimer_detail = ""
+                if dimer_dg is not None:
+                    dimer_detail = f" (ΔG = {dimer_dg:.1f} kcal/mol"
+                    if dimer_tm is not None:
+                        dimer_detail += f", Tm = {dimer_tm:.1f}°C)"
+                    else:
+                        dimer_detail += ")"
+                st.error(f"""**❌ 检测到引物间二聚体风险**{dimer_detail}
+- 两条引物之间存在互补配对区域
+- 较强的二聚体(ΔG < -9 kcal/mol)会显著降低扩增效率
+- **建议**: 更改其中一条引物的互补区域，或降低引物浓度(0.1-0.2 μM)""")
             else:
-                st.success("✅ 未检测到明显的引物二聚体风险")
+                st.success("✅ 引物间二聚体风险低，配对兼容性良好")
+            
+            if end_cross_complementary:
+                st.warning(f"""**⚠️ 3'端交叉互补**
+{cross_detail}
+- 3'端互补是引物二聚体最危险的形式
+- 聚合酶会从3'端互补处延伸，产生引物-二聚体扩增产物
+- **建议**: 重新设计其中一条引物，改变3'端序列""")
             
             if tm_diff > 2.0:
+                lower_name = fwd_name if fwd_result['tm'] < rev_result['tm'] else rev_name
+                higher_name = fwd_name if fwd_result['tm'] > rev_result['tm'] else rev_name
                 st.warning(f"""**⚠️ Tm差异过大 ({tm_diff:.1f}°C)**
-- 两条引物退火温度相差较大
-- 可能导致扩增效率不平衡
-- 建议：调整引物使Tm差异 ≤2°C""")
+- {higher_name} Tm较高，{lower_name} Tm较低
+- 退火温度设在较低Tm时，高Tm引物可能非特异性结合
+- 退火温度设在较高Tm时，低Tm引物可能结合效率低
+- **建议**: 调整{lower_name}长度以提升Tm，或缩短{higher_name}以降低Tm，使差异 ≤2°C""")
             
-            # 建议退火温度
+            # === 第三部分：PCR条件建议 ===
             st.markdown("---")
-            st.markdown("**🌡️ 建议PCR条件**")
-            recommended_tm = min(fwd_result['tm'], rev_result['tm']) - 5
-            st.write(f"**推荐退火温度:** {recommended_tm:.0f}°C (较低Tm - 5°C)")
-            st.write(f"**梯度PCR范围:** {recommended_tm-3:.0f}°C ~ {recommended_tm+3:.0f}°C")
+            st.markdown("#### 🌡️ PCR反应条件建议")
+            
+            lower_tm = min(fwd_result['tm'], rev_result['tm'])
+            higher_tm = max(fwd_result['tm'], rev_result['tm'])
+            recommended_ta = lower_tm - 5  # 经典公式: Ta = Tm(lower) - 5
+            # Chester & Marshak公式: Ta = 0.3*Tm(primer) + 0.7*Tm(product) - 14.9
+            # 简化为: Ta ≈ (Tm_fwd + Tm_rev) / 2 - 5 (适用于产物未知时)
+            alt_ta = (fwd_result['tm'] + rev_result['tm']) / 2 - 5
+            
+            pcr_col1, pcr_col2 = st.columns(2)
+            with pcr_col1:
+                st.markdown("**退火温度推荐**")
+                st.write(f"🎯 **建议退火温度:** {recommended_ta:.0f}°C")
+                st.write(f"  (基于较低Tm {lower_tm:.1f}°C - 5°C)")
+                st.write(f"📊 **梯度PCR范围:** {recommended_ta-3:.0f}°C ~ {recommended_ta+3:.0f}°C")
+                st.write(f"🔄 **备选退火温度:** {alt_ta:.0f}°C (基于平均Tm)")
+            
+            with pcr_col2:
+                st.markdown("**引物浓度建议**")
+                if has_dimer or end_cross_complementary:
+                    st.write("⚠️ 由于检测到二聚体/交叉互补风险：")
+                    st.write("  推荐引物浓度: **0.1-0.2 μM** (降低浓度减少二聚体)")
+                else:
+                    st.write("✅ 推荐引物浓度: **0.2-0.5 μM** (标准浓度)")
+                
+                if product_size_input > 0:
+                    st.write(f"\n**产物信息:** {product_size_input} bp")
+                    if product_size_input < 100:
+                        st.write("  适合: qPCR、快速PCR")
+                    elif product_size_input <= 500:
+                        st.write("  适合: 常规PCR、克隆")
+                    elif product_size_input <= 2000:
+                        st.write("  适合: 基因扩增 (考虑用高保真酶)")
+                    else:
+                        st.write("  ⚠️ 长片段扩增，推荐高保真长片段聚合酶")
+                    
+                    # 估算延伸时间 (Taq: ~1kb/min, 高保真: ~0.5kb/min)
+                    ext_time_taq = max(15, product_size_input / 1000 * 60)
+                    st.write(f"  Taq延伸时间: ~{ext_time_taq:.0f}秒 (72°C)")
+            
+            # === 第四部分：优化建议 ===
+            st.markdown("---")
+            st.markdown("#### 💡 优化建议")
+            pair_suggestions = []
+            
+            if tm_diff > 2.0:
+                pair_suggestions.append(f"优先解决Tm差异({tm_diff:.1f}°C): 调整引物长度使两条引物Tm差异≤2°C")
+            if has_dimer and dimer_dg is not None and dimer_dg < -12:
+                pair_suggestions.append(f"二聚体ΔG={dimer_dg:.1f} kcal/mol较强: 建议重新设计避免互补区域")
+            elif has_dimer:
+                pair_suggestions.append("检测到轻度二聚体风险: 可通过降低引物浓度(0.1-0.2μM)或使用热启动酶缓解")
+            if end_cross_complementary:
+                pair_suggestions.append("3'端交叉互补是最需优先解决的问题: 必须重新设计以消除3'端互补")
+            
+            # 单引物问题
+            for name, result in [(fwd_name, fwd_result), (rev_name, rev_result)]:
+                if result.get('has_hairpin'):
+                    pair_suggestions.append(f"{name}存在发夹风险: 调整长度或位置以打破回文结构")
+                if result.get('has_self_dimer'):
+                    pair_suggestions.append(f"{name}有自身二聚体风险: 检查内部自互补区域")
+                if result['gc_content'] < 35 or result['gc_content'] > 65:
+                    pair_suggestions.append(f"{name} GC含量({result['gc_content']:.0f}%)不理想: 推荐40-60%范围")
+            
+            if pair_suggestions:
+                for i, s in enumerate(pair_suggestions, 1):
+                    st.write(f"{i}. {s}")
+            else:
+                st.success("✅ 引物对质量优良，各项指标均达标，可直接用于PCR实验")
     
     else:  # 小麦KASP引物分析
-        st.markdown("#### 📝 输入KASP引物组")
+        st.markdown("#### 🌾 小麦KASP引物组专项分析")
+        st.markdown("""
+        <div class="success-box">
+        <b>🌾 小麦KASP引物专项分析</b><br>
+        针对六倍体小麦(AABBDD)KASP基因分型引物的专业评估工具<br>
+        <b>分析内容：</b>荧光尾巴验证、等位基因区分能力、ASP/Common Tm平衡、五大忌检测、引物间交叉反应
+        </div>
+        """, unsafe_allow_html=True)
         
         # 检测是否有KASP临时输入
         has_temp_kasp_input = (st.session_state.get('temp_kasp_allele1_input') or 
@@ -4783,34 +4994,41 @@ def show_primer_analysis():
                     st.session_state['temp_kasp_common_input'] = ""
                     st.rerun()
         
-        st.info("""**小麦KASP引物组包括：**
-- 2条等位基因特异性引物（带FAM/HEX荧光尾巴）
-- 1条通用反向引物（Common Primer）""")
+        st.markdown("""
+        **KASP引物组组成（输入完整序列）：**
+        - 🔵 **Allele 1 (FAM)**: FAM荧光尾巴 + 等位基因特异性序列
+        - 🟢 **Allele 2 (HEX)**: HEX荧光尾巴 + 等位基因特异性序列  
+        - ⬛ **Common**: 通用反向引物（无荧光标记）
+        """)
         
-        allele1_input = st.text_area("Allele 1 引物（完整，含FAM尾巴）", 
-                                     value=st.session_state.get('temp_kasp_allele1_input', ""),
-                                     height=80,
-                                     key="kasp_allele1_area")
-        # 自动保存到临时缓冲区
-        st.session_state['temp_kasp_allele1_input'] = allele1_input
+        # 三栏输入布局
+        kasp_input_col1, kasp_input_col2 = st.columns(2)
+        with kasp_input_col1:
+            allele1_input = st.text_area("🔵 Allele 1 引物（含FAM尾巴）", 
+                                         value=st.session_state.get('temp_kasp_allele1_input', ""),
+                                         placeholder="FAM尾巴: GAAGGTGACCAAGTTCATGCT\n+ 特异性核心序列",
+                                         height=80,
+                                         key="kasp_allele1_area")
+            st.session_state['temp_kasp_allele1_input'] = allele1_input
         
-        allele2_input = st.text_area("Allele 2 引物（完整，含HEX尾巴）", 
-                                     value=st.session_state.get('temp_kasp_allele2_input', ""),
-                                     height=80,
-                                     key="kasp_allele2_area")
-        # 自动保存到临时缓冲区
-        st.session_state['temp_kasp_allele2_input'] = allele2_input
+        with kasp_input_col2:
+            allele2_input = st.text_area("🟢 Allele 2 引物（含HEX尾巴）", 
+                                         value=st.session_state.get('temp_kasp_allele2_input', ""),
+                                         placeholder="HEX尾巴: GAAGGTCGGAGTCAACGGATT\n+ 特异性核心序列",
+                                         height=80,
+                                         key="kasp_allele2_area")
+            st.session_state['temp_kasp_allele2_input'] = allele2_input
         
-        common_input = st.text_area("Common 反向引物", 
+        common_input = st.text_area("⬛ Common 反向引物", 
                                     value=st.session_state.get('temp_kasp_common_input', ""),
+                                    placeholder="通用反向引物序列 (5'→3')",
                                     height=80,
                                     key="kasp_common_area")
-        # 自动保存到临时缓冲区
         st.session_state['temp_kasp_common_input'] = common_input
         
         if st.button("🌾 分析小麦KASP引物", type="primary"):
             if not (allele1_input and allele2_input and common_input):
-                st.warning("请输入完整的KASP引物组")
+                st.warning("请输入完整的KASP引物组（3条引物）")
                 return
             
             allele1 = re.sub(r'[^ATGC]', '', allele1_input.upper())
@@ -4820,94 +5038,386 @@ def show_primer_analysis():
             config = KASPConfig()
             config.WHEAT_MODE = True
             
-            # 提取核心序列（去除荧光尾巴）
-            fam_tail_len = len(config.FAM_TAIL)
-            hex_tail_len = len(config.HEX_TAIL)
+            # === 荧光尾巴验证 ===
+            fam_tail = config.FAM_TAIL.upper()
+            hex_tail = config.HEX_TAIL.upper()
+            fam_tail_len = len(fam_tail)
+            hex_tail_len = len(hex_tail)
             
-            core1 = allele1[fam_tail_len:] if len(allele1) > fam_tail_len else allele1
-            core2 = allele2[hex_tail_len:] if len(allele2) > hex_tail_len else allele2
+            has_fam_tail = allele1.startswith(fam_tail)
+            has_hex_tail = allele2.startswith(hex_tail)
             
-            # 分析核心序列
+            # 提取核心序列
+            if has_fam_tail:
+                core1 = allele1[fam_tail_len:]
+            else:
+                core1 = allele1  # 用户可能输入的是去尾巴的序列
+            
+            if has_hex_tail:
+                core2 = allele2[hex_tail_len:]
+            else:
+                core2 = allele2
+            
+            if len(core1) < 5 or len(core2) < 5 or len(common) < 10:
+                st.error("❌ 核心序列过短，请检查输入")
+                return
+            
+            # === 使用KASP盐浓度计算Tm ===
+            tm_core1 = calc_tm(core1, mv_conc=THERMO_PARAMS.kasp_mv_conc,
+                               dv_conc=THERMO_PARAMS.kasp_dv_conc,
+                               dntp_conc=THERMO_PARAMS.kasp_dntp_conc,
+                               dna_conc=THERMO_PARAMS.kasp_dna_conc)
+            tm_core2 = calc_tm(core2, mv_conc=THERMO_PARAMS.kasp_mv_conc,
+                               dv_conc=THERMO_PARAMS.kasp_dv_conc,
+                               dntp_conc=THERMO_PARAMS.kasp_dntp_conc,
+                               dna_conc=THERMO_PARAMS.kasp_dna_conc)
+            tm_common = calc_tm(common, mv_conc=THERMO_PARAMS.kasp_mv_conc,
+                                dv_conc=THERMO_PARAMS.kasp_dv_conc,
+                                dntp_conc=THERMO_PARAMS.kasp_dntp_conc,
+                                dna_conc=THERMO_PARAMS.kasp_dna_conc)
+            
+            gc_core1 = calc_gc_content(core1)
+            gc_core2 = calc_gc_content(core2)
+            gc_common = calc_gc_content(common)
+            
+            # 评估各引物质量
             eval1 = evaluate_primer_quality(core1, config)
+            eval1['tm'] = tm_core1  # 使用KASP盐浓度的Tm
             eval2 = evaluate_primer_quality(core2, config)
+            eval2['tm'] = tm_core2
             eval_common = evaluate_primer_quality(common, config)
+            eval_common['tm'] = tm_common
+            
+            # 检测二聚体
+            has_dimer_12, dimer_12_dg, dimer_12_tm = check_heterodimer(core1, core2)
+            has_dimer_1c, dimer_1c_dg, dimer_1c_tm = check_heterodimer(core1, common)
+            has_dimer_2c, dimer_2c_dg, dimer_2c_tm = check_heterodimer(core2, common)
             
             # 小麦特异性分析
-            upstream = ""  # 简化，仅分析引物本身
+            upstream = ""
             downstream = ""
             wheat_bonus, wheat_issues, wheat_details = evaluate_kasp_wheat_specificity(
                 upstream, downstream, core1, common, config
             )
             
-            # 显示结果
+            # ---- 显示结果 ----
             st.markdown("---")
-            st.markdown("### 🌾 小麦KASP引物分析报告")
+            st.markdown("### 🌾 小麦KASP引物组专项分析报告")
             
-            # 五大忌检测结果
-            st.markdown("**五大忌检测结果：**")
-            checks = [
-                ("1️⃣ 同源基因干扰", "需要BLAST验证", "⚠️"),
-                ("2️⃣ 侧翼SNP干扰", wheat_details.get('flanking_risk', False), "❌" if wheat_details.get('flanking_risk', False) else "✅"),
-                ("3️⃣ 扩增子长度", "无法计算（缺少完整序列）", "ℹ️"),
-                ("4️⃣ GC含量极端", f"Core1:{eval1['gc_content']:.1f}% Core2:{eval2['gc_content']:.1f}% Common:{eval_common['gc_content']:.1f}%", 
-                 "✅" if all(30 <= x['gc_content'] <= 65 for x in [eval1, eval2, eval_common]) else "❌"),
-                ("5️⃣ 重复序列", wheat_details.get('has_repeat', False), "❌" if wheat_details.get('has_repeat', False) else "✅"),
-            ]
-            
-            for check_name, check_result, check_icon in checks:
-                if isinstance(check_result, bool):
-                    result_text = "检测到" if check_result else "通过"
+            # === 第一部分：荧光尾巴验证 ===
+            st.markdown("#### 🏷️ 荧光尾巴验证")
+            tail_col1, tail_col2 = st.columns(2)
+            with tail_col1:
+                if has_fam_tail:
+                    st.success(f"✅ Allele 1 FAM尾巴正确")
+                    st.caption(f"FAM: `{fam_tail}` ({fam_tail_len}bp)")
                 else:
-                    result_text = str(check_result)
-                st.write(f"{check_icon} **{check_name}:** {result_text}")
+                    # 检查是否可能尾巴有误
+                    if len(allele1) > 30:
+                        st.warning(f"⚠️ Allele 1 未检测到标准FAM尾巴")
+                        st.caption(f"期望: `{fam_tail}`")
+                        st.caption(f"实际5': `{allele1[:fam_tail_len]}`")
+                        # 计算相似度
+                        matches = sum(1 for a, b in zip(allele1[:fam_tail_len], fam_tail) if a == b)
+                        st.caption(f"匹配率: {matches}/{fam_tail_len} ({matches/fam_tail_len*100:.0f}%)")
+                    else:
+                        st.info("ℹ️ Allele 1 序列较短，可能未包含FAM尾巴 (将整条序列作为核心分析)")
             
-            # 引物详情
+            with tail_col2:
+                if has_hex_tail:
+                    st.success(f"✅ Allele 2 HEX尾巴正确")
+                    st.caption(f"HEX: `{hex_tail}` ({hex_tail_len}bp)")
+                else:
+                    if len(allele2) > 30:
+                        st.warning(f"⚠️ Allele 2 未检测到标准HEX尾巴")
+                        st.caption(f"期望: `{hex_tail}`")
+                        st.caption(f"实际5': `{allele2[:hex_tail_len]}`")
+                        matches = sum(1 for a, b in zip(allele2[:hex_tail_len], hex_tail) if a == b)
+                        st.caption(f"匹配率: {matches}/{hex_tail_len} ({matches/hex_tail_len*100:.0f}%)")
+                    else:
+                        st.info("ℹ️ Allele 2 序列较短，可能未包含HEX尾巴 (将整条序列作为核心分析)")
+            
+            # === 第二部分：等位基因区分能力分析 ===
             st.markdown("---")
-            col1, col2, col3 = st.columns(3)
+            st.markdown("#### 🎯 等位基因区分能力")
             
-            with col1:
-                st.markdown("**Allele 1 引物**")
-                st.caption(f"核心: {len(core1)}bp | Tm: {eval1['tm']}°C | GC: {eval1['gc_content']:.1f}%")
-                grade1, _, _ = get_quality_grade(eval1['score'])
-                st.write(f"评分: {eval1['score']:.0f} ({grade1})")
+            # 比较两个ASP核心序列的差异
+            snp_base_1 = core1[-1] if core1 else '?'
+            snp_base_2 = core2[-1] if core2 else '?'
             
-            with col2:
-                st.markdown("**Allele 2 引物**")
-                st.caption(f"核心: {len(core2)}bp | Tm: {eval2['tm']}°C | GC: {eval2['gc_content']:.1f}%")
-                grade2, _, _ = get_quality_grade(eval2['score'])
-                st.write(f"评分: {eval2['score']:.0f} ({grade2})")
+            # 检查核心序列差异
+            min_core_len = min(len(core1), len(core2))
+            diff_positions = []
+            for i in range(min_core_len):
+                # 从3'端对齐比较
+                pos1 = len(core1) - min_core_len + i
+                pos2 = len(core2) - min_core_len + i
+                if core1[pos1] != core2[pos2]:
+                    diff_positions.append((i - min_core_len, core1[pos1], core2[pos2]))
             
-            with col3:
-                st.markdown("**Common 引物**")
-                st.caption(f"长度: {len(common)}bp | Tm: {eval_common['tm']}°C | GC: {eval_common['gc_content']:.1f}%")
-                grade_c, _, _ = get_quality_grade(eval_common['score'])
-                st.write(f"评分: {eval_common['score']:.0f} ({grade_c})")
+            discrim_col1, discrim_col2 = st.columns(2)
+            with discrim_col1:
+                st.markdown("**ASP引物3'端SNP碱基**")
+                st.write(f"🔵 Allele 1 (FAM): 3'端 = **{snp_base_1}**")
+                st.write(f"🟢 Allele 2 (HEX): 3'端 = **{snp_base_2}**")
+                if snp_base_1 != snp_base_2:
+                    st.success(f"✅ SNP区分: {snp_base_1}/{snp_base_2}")
+                    # 判断强弱SNP
+                    strong_bases = {'G', 'C'}
+                    weak_bases = {'A', 'T'}
+                    if {snp_base_1, snp_base_2} <= strong_bases:
+                        st.caption("SNP类型: G/C (强/强) - 区分力强")
+                    elif {snp_base_1, snp_base_2} <= weak_bases:
+                        st.caption("SNP类型: A/T (弱/弱) - 区分力较弱，人工错配更重要")
+                    elif snp_base_1 in strong_bases or snp_base_2 in strong_bases:
+                        st.caption(f"SNP类型: {'强' if snp_base_1 in strong_bases else '弱'}/{'强' if snp_base_2 in strong_bases else '弱'} - 区分力中等")
+                else:
+                    st.error("❌ 两条ASP引物3'端碱基相同，无法区分等位基因！")
             
-            # Tm匹配
-            tm_diff = abs(eval1['tm'] - eval2['tm'])
+            with discrim_col2:
+                st.markdown("**序列差异分析**")
+                st.write(f"核心序列差异位点: {len(diff_positions)}个")
+                if diff_positions:
+                    for pos, b1, b2 in diff_positions[-5:]:  # 显示最后5个差异
+                        pos_label = f"3'端第{abs(pos)}位" if pos < 0 else f"位置{pos}"
+                        st.caption(f"  {pos_label}: {b1}→{b2}")
+                
+                # 检查n-3位人工错配
+                if len(core1) >= 3 and len(core2) >= 3:
+                    n3_base_1 = core1[-3]
+                    n3_base_2 = core2[-3]
+                    st.write(f"**n-3位碱基:** ASP1={n3_base_1}, ASP2={n3_base_2}")
+                    if len(diff_positions) >= 2:
+                        # 检查除SNP外是否在n-3位还有差异
+                        n3_diff = any(pos == -3 for pos, _, _ in diff_positions)
+                        if n3_diff:
+                            st.caption("✅ 检测到n-3位人工错配 (增强等位基因区分)")
+                        else:
+                            st.caption("ℹ️ n-3位未见人工错配")
+            
+            # === 第三部分：Tm平衡分析 (KASP特有) ===
             st.markdown("---")
-            if tm_diff <= 1.0:
-                st.success(f"✅ Allele引物Tm差异: {tm_diff:.1f}°C (优秀)")
-            elif tm_diff <= 2.0:
-                st.info(f"ℹ️ Allele引物Tm差异: {tm_diff:.1f}°C (可接受)")
+            st.markdown("#### 🌡️ KASP Tm平衡分析")
+            
+            asp_tm_diff = abs(tm_core1 - tm_core2)
+            asp_common_tm_diff1 = abs(tm_core1 - tm_common)
+            asp_common_tm_diff2 = abs(tm_core2 - tm_common)
+            
+            tm_col1, tm_col2, tm_col3, tm_col4 = st.columns(4)
+            with tm_col1:
+                tm_ok1 = 60.0 <= tm_core1 <= 62.0
+                st.metric("ASP1 Tm", f"{tm_core1:.1f}°C", 
+                         delta=f"{'🟢' if tm_ok1 else '🟡'} 目标60-62°C")
+            with tm_col2:
+                tm_ok2 = 60.0 <= tm_core2 <= 62.0
+                st.metric("ASP2 Tm", f"{tm_core2:.1f}°C",
+                         delta=f"{'🟢' if tm_ok2 else '🟡'} 目标60-62°C")
+            with tm_col3:
+                tm_ok_c = 60.0 <= tm_common <= 63.0
+                st.metric("Common Tm", f"{tm_common:.1f}°C",
+                         delta=f"{'🟢' if tm_ok_c else '🟡'} 目标60-63°C")
+            with tm_col4:
+                asp_diff_ok = asp_tm_diff <= 2.0
+                st.metric("ASP Tm差", f"{asp_tm_diff:.1f}°C",
+                         delta=f"{'✅≤2°C' if asp_diff_ok else '❌>2°C'}")
+            
+            # Tm平衡评价
+            if asp_tm_diff <= 1.0:
+                st.success(f"✅ ASP引物Tm差异: {asp_tm_diff:.1f}°C (优秀 ≤1°C) - 确保荧光信号均衡")
+            elif asp_tm_diff <= 2.0:
+                st.info(f"ℹ️ ASP引物Tm差异: {asp_tm_diff:.1f}°C (可接受 ≤2°C)")
             else:
-                st.warning(f"⚠️ Allele引物Tm差异: {tm_diff:.1f}°C (过大)")
+                st.error(f"❌ ASP引物Tm差异: {asp_tm_diff:.1f}°C (过大 >2°C) - 可能导致等位基因信号强度不均")
             
-            # 小麦特异性问题
-            if wheat_issues:
-                st.markdown("---")
-                st.markdown("**⚠️ 小麦特异性问题：**")
-                for issue in wheat_issues:
-                    st.write(f"• {issue}")
+            # ASP与Common的Tm关系
+            avg_asp_tm = (tm_core1 + tm_core2) / 2
+            asp_common_diff = abs(avg_asp_tm - tm_common)
+            if asp_common_diff <= 3.0:
+                st.success(f"✅ ASP与Common Tm差异: {asp_common_diff:.1f}°C (良好 ≤3°C)")
+            else:
+                st.warning(f"⚠️ ASP与Common Tm差异: {asp_common_diff:.1f}°C (偏大) - Common引物应与ASP引物Tm接近")
             
-            # 建议
+            # === 第四部分：引物详细参数 ===
             st.markdown("---")
-            st.markdown("**💡 重要建议：**")
-            st.write("1. 将所有引物序列BLAST到小麦A、B、D三个基因组")
-            st.write("2. 确认引物只匹配目标基因组")
-            st.write("3. 如需基因组特异性，在Common引物区域添加Homoeologous SNP")
-            st.write("4. 使用PolyMarker工具验证设计")
-            st.write("5. 推荐产物大小50-100bp")
+            st.markdown("#### 📋 引物详细参数")
+            
+            # 三栏展示
+            det_col1, det_col2, det_col3 = st.columns(3)
+            
+            with det_col1:
+                st.markdown("**🔵 Allele 1 (FAM)**")
+                st.code(f"5'- {core1} -3'")
+                grade1, stars1, css1 = get_quality_grade(eval1['score'])
+                st.markdown(f"<span class='{css1}'>{grade1} {stars1} ({eval1['score']:.0f}分)</span>", unsafe_allow_html=True)
+                st.caption(f"核心长度: {len(core1)}bp | Tm: {tm_core1:.1f}°C | GC: {gc_core1:.1f}%")
+                st.caption(f"3'端: `{core1[-5:]}` | 发夹: {'❌' if eval1['has_hairpin'] else '✅'} | 二聚体: {'❌' if eval1['has_self_dimer'] else '✅'}")
+                if eval1['issues']:
+                    for iss in eval1['issues'][:2]:
+                        st.caption(f"⚠️ {iss}")
+            
+            with det_col2:
+                st.markdown("**🟢 Allele 2 (HEX)**")
+                st.code(f"5'- {core2} -3'")
+                grade2, stars2, css2 = get_quality_grade(eval2['score'])
+                st.markdown(f"<span class='{css2}'>{grade2} {stars2} ({eval2['score']:.0f}分)</span>", unsafe_allow_html=True)
+                st.caption(f"核心长度: {len(core2)}bp | Tm: {tm_core2:.1f}°C | GC: {gc_core2:.1f}%")
+                st.caption(f"3'端: `{core2[-5:]}` | 发夹: {'❌' if eval2['has_hairpin'] else '✅'} | 二聚体: {'❌' if eval2['has_self_dimer'] else '✅'}")
+                if eval2['issues']:
+                    for iss in eval2['issues'][:2]:
+                        st.caption(f"⚠️ {iss}")
+            
+            with det_col3:
+                st.markdown("**⬛ Common 引物**")
+                st.code(f"5'- {common} -3'")
+                grade_c, stars_c, css_c = get_quality_grade(eval_common['score'])
+                st.markdown(f"<span class='{css_c}'>{grade_c} {stars_c} ({eval_common['score']:.0f}分)</span>", unsafe_allow_html=True)
+                st.caption(f"长度: {len(common)}bp | Tm: {tm_common:.1f}°C | GC: {gc_common:.1f}%")
+                st.caption(f"3'端: `{common[-5:]}` | 发夹: {'❌' if eval_common['has_hairpin'] else '✅'} | 二聚体: {'❌' if eval_common['has_self_dimer'] else '✅'}")
+                if eval_common['issues']:
+                    for iss in eval_common['issues'][:2]:
+                        st.caption(f"⚠️ {iss}")
+            
+            # === 第五部分：引物间交叉反应 ===
+            st.markdown("---")
+            st.markdown("#### ⚡ 引物间交叉反应检测")
+            
+            cross_col1, cross_col2, cross_col3 = st.columns(3)
+            with cross_col1:
+                if has_dimer_12:
+                    detail = f" (ΔG={dimer_12_dg:.1f})" if dimer_12_dg else ""
+                    st.error(f"❌ ASP1×ASP2 二聚体{detail}")
+                else:
+                    st.success("✅ ASP1×ASP2 无二聚体")
+            with cross_col2:
+                if has_dimer_1c:
+                    detail = f" (ΔG={dimer_1c_dg:.1f})" if dimer_1c_dg else ""
+                    st.error(f"❌ ASP1×Common 二聚体{detail}")
+                else:
+                    st.success("✅ ASP1×Common 无二聚体")
+            with cross_col3:
+                if has_dimer_2c:
+                    detail = f" (ΔG={dimer_2c_dg:.1f})" if dimer_2c_dg else ""
+                    st.error(f"❌ ASP2×Common 二聚体{detail}")
+                else:
+                    st.success("✅ ASP2×Common 无二聚体")
+            
+            if any([has_dimer_12, has_dimer_1c, has_dimer_2c]):
+                st.caption("⚠️ KASP三引物体系中的二聚体比常规PCR更严重：ASP引物浓度仅为Common的一半，二聚体会显著降低荧光信号")
+            
+            # === 第六部分：五大忌检测 ===
+            st.markdown("---")
+            st.markdown("#### 🚫 小麦KASP五大忌检测")
+            
+            # 逐项检测
+            taboo_results = []
+            
+            # 1. 同源基因干扰
+            complexity1 = analyze_sequence_complexity(core1)
+            complexity2 = analyze_sequence_complexity(core2)
+            complexity_c = analyze_sequence_complexity(common)
+            avg_complexity = (complexity1['complexity_score'] + complexity2['complexity_score'] + complexity_c['complexity_score']) / 3
+            if avg_complexity >= 70:
+                taboo_results.append(("1️⃣ 同源基因干扰", "序列复杂度较高，仍需BLAST验证", "⚠️", f"平均复杂度: {avg_complexity:.0f}/100"))
+            else:
+                taboo_results.append(("1️⃣ 同源基因干扰", "序列复杂度较低，高风险", "❌", f"平均复杂度: {avg_complexity:.0f}/100，在A/B/D基因组可能多位点匹配"))
+            
+            # 2. 侧翼干扰
+            flanking_risk = wheat_details.get('flanking_risk', False)
+            taboo_results.append(("2️⃣ 侧翼SNP干扰", "通过" if not flanking_risk else "检测到风险", "✅" if not flanking_risk else "❌", "引物结合区域内未检测到明显的变异热点" if not flanking_risk else "引物区域含可能的变异位点"))
+            
+            # 3. 扩增子长度 (无法精确计算，但可以提示)
+            taboo_results.append(("3️⃣ 扩增子长度", "需实验验证", "ℹ️", "KASP最佳产物大小50-100bp，请确认设计符合要求"))
+            
+            # 4. GC含量
+            all_gc_ok = all(30 <= x <= 65 for x in [gc_core1, gc_core2, gc_common])
+            gc_detail = f"ASP1:{gc_core1:.0f}% | ASP2:{gc_core2:.0f}% | Common:{gc_common:.0f}%"
+            if all_gc_ok:
+                taboo_results.append(("4️⃣ GC含量极端", "通过", "✅", f"{gc_detail} (均在30-65%范围内)"))
+            else:
+                taboo_results.append(("4️⃣ GC含量极端", "异常", "❌", f"{gc_detail} (超出30-65%安全范围)"))
+            
+            # 5. 重复序列
+            has_repeat1, rep_issues1 = check_wheat_repeat_sequences(core1)
+            has_repeat2, rep_issues2 = check_wheat_repeat_sequences(core2)
+            has_repeat_c, rep_issues_c = check_wheat_repeat_sequences(common)
+            any_repeat = has_repeat1 or has_repeat2 or has_repeat_c
+            if any_repeat:
+                all_rep_issues = rep_issues1 + rep_issues2 + rep_issues_c
+                taboo_results.append(("5️⃣ 重复序列", "检测到", "❌", "; ".join(all_rep_issues[:3])))
+            else:
+                taboo_results.append(("5️⃣ 重复序列", "通过", "✅", "未检测到转座子/SSR特征"))
+            
+            # 展示五大忌结果
+            for name, status, icon, detail in taboo_results:
+                with st.expander(f"{icon} {name}: {status}", expanded=(icon == "❌")):
+                    st.write(detail)
+            
+            # === 第七部分：综合评价与建议 ===
+            st.markdown("---")
+            st.markdown("#### 💡 综合评价与建议")
+            
+            # 计算KASP综合评分
+            kasp_total_score = (eval1['score'] + eval2['score'] + eval_common['score']) / 3
+            if asp_tm_diff <= 1.0:
+                kasp_total_score += 10
+            elif asp_tm_diff <= 2.0:
+                kasp_total_score += 5
+            else:
+                kasp_total_score -= 15
+            if asp_common_diff <= 3.0:
+                kasp_total_score += 5
+            else:
+                kasp_total_score -= 10
+            if any([has_dimer_12, has_dimer_1c, has_dimer_2c]):
+                kasp_total_score -= 10
+            if not all_gc_ok:
+                kasp_total_score -= 10
+            if any_repeat:
+                kasp_total_score -= 10
+            kasp_total_score = max(0, min(100, kasp_total_score))
+            kasp_grade, kasp_stars, kasp_css = get_quality_grade(kasp_total_score)
+            
+            st.markdown(f"<h3 style='text-align:center;'><span class='{kasp_css}'>KASP引物组综合评分: {kasp_grade} {kasp_stars} ({kasp_total_score:.0f}分)</span></h3>", unsafe_allow_html=True)
+            
+            kasp_suggestions = []
+            
+            # 基于分析结果的针对性建议
+            if not has_fam_tail or not has_hex_tail:
+                kasp_suggestions.append("请确认引物是否包含正确的FAM/HEX荧光尾巴，尾巴序列错误会导致荧光信号缺失")
+            
+            if snp_base_1 == snp_base_2:
+                kasp_suggestions.append("❗ 两条ASP引物3'端碱基相同，无法区分等位基因，请检查引物设计")
+            
+            if asp_tm_diff > 2.0:
+                lower_asp = "ASP1" if tm_core1 < tm_core2 else "ASP2"
+                kasp_suggestions.append(f"ASP引物Tm差异{asp_tm_diff:.1f}°C过大: 调整{lower_asp}长度使两者Tm差异≤2°C，确保荧光信号均衡")
+            
+            if not (60 <= tm_core1 <= 62) or not (60 <= tm_core2 <= 62):
+                kasp_suggestions.append(f"ASP引物Tm应在60-62°C (LGC标准): ASP1={tm_core1:.1f}°C, ASP2={tm_core2:.1f}°C")
+            
+            if asp_common_diff > 3.0:
+                kasp_suggestions.append(f"Common引物Tm({tm_common:.1f}°C)与ASP平均Tm({avg_asp_tm:.1f}°C)差异{asp_common_diff:.1f}°C: 调整Common引物长度以匹配")
+            
+            if any([has_dimer_12, has_dimer_1c, has_dimer_2c]):
+                dimer_pairs = []
+                if has_dimer_12: dimer_pairs.append("ASP1×ASP2")
+                if has_dimer_1c: dimer_pairs.append("ASP1×Common")
+                if has_dimer_2c: dimer_pairs.append("ASP2×Common")
+                kasp_suggestions.append(f"检测到引物间二聚体({", ".join(dimer_pairs)}): KASP反应中三引物共存，二聚体会严重影响荧光信号")
+            
+            if not all_gc_ok:
+                kasp_suggestions.append("GC含量超出30-65%范围: 小麦基因组GC含量约45%，极端GC引物易形成二级结构或Tm异常")
+            
+            if any_repeat:
+                kasp_suggestions.append("含重复/转座子序列特征: 小麦基因组>85%为重复序列，引物位于重复区会导致多位点扩增")
+            
+            # 通用KASP建议
+            kasp_suggestions.append("务必将所有引物BLAST到IWGSC RefSeq v2.1 (A/B/D三个基因组)，确认引物仅匹配目标位点")
+            kasp_suggestions.append("如需基因组特异性区分，在Common引物区域利用Homoeologous SNP")
+            kasp_suggestions.append("推荐使用PolyMarker (http://polymarker.tgac.ac.uk) 工具验证引物特异性")
+            
+            for i, sug in enumerate(kasp_suggestions, 1):
+                st.write(f"{i}. {sug}")
 
 
 def show_help():
