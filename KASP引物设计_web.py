@@ -9,9 +9,51 @@ import streamlit as st
 import re
 import csv
 import io
+import time
 from datetime import datetime
 from typing import List, Dict, Tuple, Optional, Any
 from dataclasses import dataclass
+
+# ==================== BLAST 模块（懒加载） ====================
+# 默认标记为未加载，访问 BLAST 相关页面时才实际导入
+BLAST_MODULE_AVAILABLE = False
+BLAST_TOOL_AVAILABLE = False
+blast_sequence_ncbi = None
+analyze_specificity_for_design = None
+extract_homolog_sequences = None
+check_local_blast_available = None
+build_local_database = None
+blast_local = None
+clear_blast_cache = None
+BlastResult = None
+HomologGroup = None
+SNPSite = None
+
+def _lazy_load_blast():
+    """按需加载 blast_module，避免启动时导入 biopython"""
+    global BLAST_MODULE_AVAILABLE, BLAST_TOOL_AVAILABLE
+    global blast_sequence_ncbi, analyze_specificity_for_design, extract_homolog_sequences
+    global check_local_blast_available, build_local_database, blast_local, clear_blast_cache
+    global BlastResult, HomologGroup, SNPSite
+    if BLAST_MODULE_AVAILABLE:
+        return  # 已加载
+    try:
+        import blast_module as _bm
+        blast_sequence_ncbi = _bm.blast_sequence_ncbi
+        analyze_specificity_for_design = _bm.analyze_specificity_for_design
+        extract_homolog_sequences = _bm.extract_homolog_sequences
+        check_local_blast_available = _bm.check_local_blast_available
+        build_local_database = _bm.build_local_database
+        blast_local = _bm.blast_local
+        clear_blast_cache = _bm.clear_blast_cache
+        BlastResult = _bm.BlastResult
+        HomologGroup = _bm.HomologGroup
+        SNPSite = _bm.SNPSite
+        BLAST_TOOL_AVAILABLE = _bm.BIOPYTHON_AVAILABLE
+        BLAST_MODULE_AVAILABLE = True
+    except ImportError:
+        BLAST_MODULE_AVAILABLE = False
+        BLAST_TOOL_AVAILABLE = False
 
 # 尝试导入primer3库
 try:
@@ -5420,6 +5462,661 @@ def show_primer_analysis():
                 st.write(f"{i}. {sug}")
 
 
+# ==================== BLAST 特异性验证 ====================
+
+def show_blast_verification():
+    """BLAST 特异性验证页面（v2 增强版）"""
+    _lazy_load_blast()
+    st.markdown("## 🌐 BLAST 特异性验证")
+    st.markdown(
+        "使用 **NCBI 远程 BLAST** 或 **本地 BLAST 数据库** 验证引物/序列在小麦基因组中的特异性。"
+    )
+
+    if not BLAST_MODULE_AVAILABLE:
+        st.error("⚠️ 找不到 blast_module.py，请确认该文件与主程序在同一目录")
+        return
+    if not BLAST_TOOL_AVAILABLE:
+        st.error("⚠️ 缺少 Biopython 库，请运行：`pip install biopython`")
+        st.code("pip install biopython", language="bash")
+        return
+
+    tab1, tab2, tab3 = st.tabs(["🔍 单/多引物验证", "🧬 KASP 引物组验证", "💾 本地 BLAST"])
+
+    # ───────────────────────────────────────────────
+    # Tab 1：单/多引物验证
+    # ───────────────────────────────────────────────
+    with tab1:
+        st.markdown(
+            "每行输入一条引物。支持两种格式：\n"
+            "- `名称<Tab>序列`\n"
+            "- 仅序列（自动命名）"
+        )
+        with st.form("blast_multi_form"):
+            primer_input = st.text_area(
+                "引物序列",
+                height=130,
+                placeholder="Forward\tATGCGATCGATCGATCGATCG\nATGCGATCGATCGATCGATCA",
+            )
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                organism = st.selectbox(
+                    "验证物种",
+                    ["小麦 (Triticum aestivum)", "拟南芥 (Arabidopsis thaliana)",
+                     "水稻 (Oryza sativa)", "玉米 (Zea mays)", "全部 (不限物种)"],
+                )
+            with col2:
+                hitlist = st.number_input("最大命中数", min_value=5, max_value=50, value=20)
+            with col3:
+                email = st.text_input("联系邮箱（NCBI 要求）", value="user@example.com")
+            submit1 = st.form_submit_button("🚀 开始 BLAST", type="primary", use_container_width=True)
+
+        if submit1 and primer_input.strip():
+            primers: Dict[str, str] = {}
+            for line in primer_input.strip().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 2:
+                    name = parts[0].strip()
+                    seq = re.sub(r"[^ATGCatgcNn]", "", parts[1])
+                else:
+                    seq = re.sub(r"[^ATGCatgcNn]", "", parts[0])
+                    name = f"Primer_{len(primers) + 1}"
+                if len(seq) >= 10:
+                    primers[name] = seq.upper()
+
+            if not primers:
+                st.error("未找到有效引物序列（至少 10 bp）")
+            else:
+                entrez_map = {
+                    "小麦 (Triticum aestivum)": "Triticum aestivum[Organism]",
+                    "拟南芥 (Arabidopsis thaliana)": "Arabidopsis thaliana[Organism]",
+                    "水稻 (Oryza sativa)": "Oryza sativa[Organism]",
+                    "玉米 (Zea mays)": "Zea mays[Organism]",
+                    "全部 (不限物种)": "",
+                }
+                entrez_q = entrez_map.get(organism, "Triticum aestivum[Organism]")
+                est_sec = len(primers) * 55
+
+                st.info(f"正在验证 {len(primers)} 条引物，预计约 {est_sec} 秒...")
+                progress = st.progress(0.0)
+                status = st.empty()
+                results: Dict = {}
+
+                for i, (name, seq) in enumerate(primers.items()):
+                    status.text(f"▶ 验证中: {name} ({i + 1}/{len(primers)})")
+                    progress.progress(i / len(primers))
+                    try:
+                        with st.spinner(f"BLAST {name}…"):
+                            r = blast_sequence_ncbi(
+                                seq,
+                                entrez_query=entrez_q,
+                                hitlist=hitlist,
+                                email=email,
+                            )
+                        results[name] = r
+                    except Exception as e:
+                        results[name] = None
+                        st.warning(f"{name}: BLAST 失败 — {e}")
+                    if i < len(primers) - 1:
+                        time.sleep(3.5)
+
+                progress.progress(1.0)
+                status.text("✅ 全部完成！")
+                st.session_state["blast_tab1_results"] = results
+
+        if "blast_tab1_results" in st.session_state:
+            _render_blast_results_table(st.session_state["blast_tab1_results"])
+
+    # ───────────────────────────────────────────────
+    # Tab 2：KASP 引物组验证
+    # ───────────────────────────────────────────────
+    with tab2:
+        st.markdown("一次性验证 ASP1（FAM）、ASP2（HEX）、Common 三条引物的特异性，并给出综合评分。")
+        with st.form("blast_kasp_form"):
+            c1, c2 = st.columns(2)
+            with c1:
+                asp1 = st.text_input("ASP1 (FAM) 核心引物（不含荧光尾巴）", placeholder="ATGCGATCGATCG…")
+                asp2 = st.text_input("ASP2 (HEX) 核心引物（不含荧光尾巴）", placeholder="ATGCGATCGATCG…")
+            with c2:
+                common = st.text_input("Common 引物序列", placeholder="ATGCGATCGATCG…")
+                email2 = st.text_input("联系邮箱", value="user@example.com", key="email_kasp")
+            submit_kasp = st.form_submit_button("🚀 验证 KASP 引物组", type="primary", use_container_width=True)
+
+        if submit_kasp:
+            kasp_seqs: Dict[str, str] = {}
+            for label, raw in [("ASP1_FAM", asp1), ("ASP2_HEX", asp2), ("Common", common)]:
+                s = re.sub(r"[^ATGCatgcNn]", "", raw or "")
+                if len(s) >= 10:
+                    kasp_seqs[label] = s.upper()
+
+            if not kasp_seqs:
+                st.error("请至少输入一条有效引物（≥10 bp）")
+            else:
+                st.info(f"正在验证 {len(kasp_seqs)} 条引物，预计约 {len(kasp_seqs) * 55} 秒…")
+                kasp_results: Dict = {}
+                for i, (name, seq) in enumerate(kasp_seqs.items()):
+                    with st.spinner(f"BLAST {name}…"):
+                        try:
+                            kasp_results[name] = blast_sequence_ncbi(
+                                seq,
+                                entrez_query="Triticum aestivum[Organism]",
+                                hitlist=20,
+                                email=email2,
+                            )
+                        except Exception as e:
+                            kasp_results[name] = None
+                            st.warning(f"{name}: BLAST 失败 — {e}")
+                    if i < len(kasp_seqs) - 1:
+                        time.sleep(3.5)
+                st.session_state["blast_kasp_results"] = kasp_results
+
+        if "blast_kasp_results" in st.session_state:
+            results = st.session_state["blast_kasp_results"]
+            st.markdown("---")
+            st.markdown("### 📊 KASP 引物组综合评估")
+
+            valid = [r for r in results.values() if r is not None]
+            if valid:
+                avg = sum(r.specificity_score for r in valid) / len(valid)
+                if avg >= 85:
+                    st.success(f"✅ 综合特异性评分 **{avg:.0f} / 100** — 引物组可用")
+                elif avg >= 65:
+                    st.warning(f"⚠️ 综合特异性评分 **{avg:.0f} / 100** — 建议进一步验证")
+                else:
+                    st.error(f"❌ 综合特异性评分 **{avg:.0f} / 100** — 特异性不足，建议重新设计")
+
+            _render_blast_results_table(results)
+
+    # ───────────────────────────────────────────────
+    # Tab 3：本地 BLAST
+    # ───────────────────────────────────────────────
+    with tab3:
+        st.markdown("#### 💾 本地 BLAST 数据库")
+        st.markdown(
+            "如果安装了 NCBI BLAST+ 命令行工具，可以用自己的 FASTA 文件建库并快速比对。\n"
+            "适合大批量引物验证或不方便联网的情况。"
+        )
+
+        local_ok, local_ver = check_local_blast_available()
+        if local_ok:
+            st.success(f"✅ 检测到 BLAST+：{local_ver}")
+        else:
+            st.warning(
+                "⚠️ 未检测到 BLAST+ 命令行工具。请从 [NCBI](https://blast.ncbi.nlm.nih.gov/doc/blast-help/downloadblastdata.html) 下载安装后添加到 PATH。"
+            )
+
+        st.markdown("##### 1. 建库")
+        fasta_path = st.text_input("FASTA 文件路径", placeholder=r"D:\wheat_genome.fasta")
+        db_name = st.text_input("数据库名称", value="wheat_local_db")
+        if st.button("🔨 开始建库", disabled=not local_ok):
+            if fasta_path.strip():
+                with st.spinner("正在建库，请稍候…"):
+                    ok, msg = build_local_database(fasta_path.strip(), db_name.strip())
+                if ok:
+                    st.success(f"✅ 数据库已建在 {msg}")
+                    st.session_state["local_blast_db"] = msg
+                else:
+                    st.error(f"❌ 建库失败：{msg}")
+            else:
+                st.error("请输入 FASTA 文件路径")
+
+        st.markdown("##### 2. 本地比对")
+        local_db = st.text_input("数据库路径", value=st.session_state.get("local_blast_db", ""))
+        local_seq = st.text_area("待比对引物/序列", height=80, placeholder="ATGCGATCGATCGATCG…", key="local_blast_seq")
+        if st.button("🚀 本地 BLAST", disabled=not local_ok):
+            seq_clean = re.sub(r"[^ATGCatgcNn]", "", local_seq or "").upper()
+            if len(seq_clean) < 10:
+                st.error("序列过短（≥10 bp）")
+            elif not local_db.strip():
+                st.error("请指定数据库路径")
+            else:
+                with st.spinner("本地 BLAST 中…"):
+                    try:
+                        lr = blast_local(seq_clean, local_db.strip())
+                        if lr:
+                            _render_blast_results_table({"LocalQuery": lr})
+                        else:
+                            st.warning("未找到命中")
+                    except Exception as e:
+                        st.error(f"本地 BLAST 失败：{e}")
+
+    # 缓存管理
+    st.sidebar.markdown("---")
+    if st.sidebar.button("🗑️ 清空 BLAST 缓存"):
+        clear_blast_cache()
+        st.sidebar.success("缓存已清空")
+
+
+def _render_blast_results_table(results: Dict):
+    """渲染 BLAST 结果卡片列表（v2 增强版：显示 3' 端匹配、错配位置、建议）"""
+    st.markdown("---")
+    st.markdown("### 📋 验证结果")
+
+    for name, result in results.items():
+        if result is None:
+            st.error(f"❌ **{name}**: BLAST 失败（网络错误或序列无效）")
+            continue
+
+        score = result.specificity_score
+        icon = "✅" if score >= 85 else ("⚠️" if score >= 65 else "❌")
+
+        with st.expander(
+            f"{icon} **{name}** — 特异性 {score}/100 | 总命中 {result.total_hits} 条 | 耗时 {result.elapsed_seconds}s",
+            expanded=True,
+        ):
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("特异性评分", f"{score}/100")
+            c2.metric("总命中数", result.total_hits)
+            g = result.subgenome_hits
+            c3.metric("A/B/D 分布", f"A:{g.get('A',0)} B:{g.get('B',0)} D:{g.get('D',0)}")
+            perfect = len([h for h in result.hits if h.best_identity >= 95])
+            c4.metric("完美命中(≥95%)", perfect)
+
+            for w in result.warnings:
+                st.info(w)
+            for s in result.suggestions:
+                st.caption(f"💡 {s}")
+
+            if result.hits:
+                rows = []
+                for h in result.hits[:15]:
+                    three_prime_icon = "✅" if h.three_prime_match else "⚠️"
+                    mismatch_str = ""
+                    if h.mismatch_positions:
+                        mismatch_str = ",".join(str(p + 1) for p in h.mismatch_positions[:8])
+                        if len(h.mismatch_positions) > 8:
+                            mismatch_str += "…"
+                    rows.append({
+                        "命中序列": h.title[:60] + ("…" if len(h.title) > 60 else ""),
+                        "亚基因组": h.subgenome,
+                        "染色体": h.chromosome,
+                        "相似度%": h.best_identity,
+                        "覆盖度%": h.query_coverage,
+                        "E 值": f"{h.best_e_value:.2e}",
+                        "3'端": three_prime_icon,
+                        "错配位置": mismatch_str or "—",
+                    })
+                st.dataframe(rows, use_container_width=True)
+
+
+# ==================== 小麦智能特异性引物设计（v2 增强版） ====================
+
+def show_wheat_smart_design():
+    """小麦智能特异性引物设计页面（v2：同源比对 + SNP 引导）"""
+    _lazy_load_blast()
+    st.markdown("## 🌾 小麦智能特异性引物设计")
+    st.markdown("""
+**设计原理（全自动，5 步）**
+1. **BLAST 全序列** → 找到 A/B/D 三亚基因组的同源区域
+2. **同源序列比对** → 提取 A/B/D 拷贝并 Pairwise 比对，找出差异位点（SNP/InDel）
+3. **构建特异性图谱** → 结合 SNP 信息，识别目标亚基因组独有的序列区段
+4. **在特异区段内设计引物** → 优先将 3' 端放在 SNP 上，筛选 Tm/GC 合格的候选
+5. **BLAST 回验引物** → 对最优候选再次 BLAST 确认特异性
+    """)
+
+    if not BLAST_MODULE_AVAILABLE:
+        st.error("⚠️ 找不到 blast_module.py")
+        return
+    if not BLAST_TOOL_AVAILABLE:
+        st.error("⚠️ 需要安装 Biopython：`pip install biopython`")
+        st.code("pip install biopython", language="bash")
+        return
+
+    st.warning("⏱️ 本功能需调用 NCBI BLAST 多次，总耗时约 **3–8 分钟**，运行期间请勿关闭页面。")
+
+    with st.form("smart_design_form"):
+        gene_seq_input = st.text_area(
+            "目标基因序列（200–10000 bp，FASTA 格式或纯序列均可）",
+            height=150,
+            placeholder=">TaGene_1A\nATGCGATCGATCGATCGATCGATCGATCGATCGATCG…",
+        )
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            target_genome = st.radio("目标亚基因组", ["A", "B", "D"], horizontal=True,
+                                     help="只在该亚基因组特异扩增")
+        with col2:
+            primer_direction = st.selectbox("引物方向", ["正向 (Forward)", "反向 (Reverse)", "两个方向"])
+            product_range = st.slider("期望产物大小 (bp)", 100, 3000, (150, 500), step=50)
+        with col3:
+            verify_primers = st.checkbox("设计后 BLAST 回验（推荐）", value=True)
+            email_sd = st.text_input("联系邮箱", value="user@example.com", key="email_sd")
+
+        start_btn = st.form_submit_button("🚀 开始智能设计", type="primary", use_container_width=True)
+
+    if start_btn and gene_seq_input.strip():
+        # 清理序列（去 FASTA header）
+        clean = re.sub(r">.*", "", gene_seq_input)
+        clean = re.sub(r"[^ATGCatgcNn\s]", "", clean)
+        clean = re.sub(r"\s+", "", clean).upper()
+
+        if len(clean) < 100:
+            st.error("序列过短（至少 100 bp），请输入更完整的基因序列")
+        elif len(clean) > 10000:
+            st.error("序列过长（最多 10000 bp），请截取目标区域")
+        else:
+            st.session_state["sd_seq"] = clean
+            st.session_state["sd_params"] = {
+                "target_genome": target_genome,
+                "direction": primer_direction,
+                "product_range": product_range,
+                "verify": verify_primers,
+                "email": email_sd,
+            }
+            _run_wheat_smart_design()
+
+    if "sd_results" in st.session_state:
+        _display_smart_design_results()
+
+
+def _run_wheat_smart_design():
+    """执行 5 步智能设计流程（v2：含同源比对 + SNP 引导）"""
+    gene_seq = st.session_state["sd_seq"]
+    params = st.session_state["sd_params"]
+    target_genome = params["target_genome"]
+    email = params["email"]
+    do_verify = params["verify"]
+    direction_str = params["direction"]
+
+    # ── Step 1: BLAST 全基因序列 ──────────────────────────────
+    st.markdown("---")
+    st.markdown(f"#### ① BLAST {len(gene_seq)} bp 序列…")
+    try:
+        with st.spinner("正在查询 NCBI BLAST，请稍候…"):
+            gene_blast = blast_sequence_ncbi(
+                gene_seq,
+                entrez_query="Triticum aestivum[Organism]",
+                hitlist=50,
+                expect=10.0,
+                email=email,
+                megablast=True,
+            )
+    except Exception as e:
+        st.error(f"BLAST 失败：{e}")
+        return
+
+    if gene_blast is None:
+        st.error("BLAST 未返回结果，请检查序列或网络")
+        return
+
+    g = gene_blast.subgenome_hits
+    st.success(f"✅ 找到 {gene_blast.total_hits} 个同源序列 | A:{g.get('A',0)}  B:{g.get('B',0)}  D:{g.get('D',0)}")
+
+    if g.get(target_genome, 0) == 0:
+        st.warning(f"⚠️ 在 {target_genome} 亚基因组没有命中，请确认目标亚基因组选择是否正确")
+
+    # ── Step 2: 同源序列比对 + 差异位点 ──────────────────────
+    st.markdown(f"#### ② 提取 A/B/D 同源序列并比对…")
+    homolog_group = extract_homolog_sequences(gene_blast, gene_seq, target_genome=target_genome)
+
+    if homolog_group and homolog_group.snp_sites:
+        st.success(
+            f"✅ 找到 {len(homolog_group.homologs)} 个同源拷贝，"
+            f"检测到 **{len(homolog_group.snp_sites)}** 个差异位点（SNP/InDel）"
+        )
+        # 显示同源序列一致性
+        for genome, ident in homolog_group.alignment_identity.items():
+            st.caption(f"  {target_genome} vs {genome}：{ident:.1f}% 一致性（{homolog_group.homolog_accessions.get(genome, '')}）")
+
+        # 显示 Top SNP 位点
+        top_snps = homolog_group.snp_sites[:8]
+        snp_rows = []
+        for snp in top_snps:
+            alt_str = ", ".join(f"{g}:{b}" for g, b in snp.alt_bases.items())
+            snp_rows.append({
+                "位置": snp.position + 1,
+                "参考碱基": snp.ref_base,
+                "差异碱基": alt_str,
+                "类型": "InDel" if snp.is_indel else "SNP",
+                "特异性分": f"{snp.specificity_value:.0f}",
+                "5'侧翼": snp.flanking_5[-8:] if snp.flanking_5 else "",
+                "3'侧翼": snp.flanking_3[:8] if snp.flanking_3 else "",
+            })
+        st.dataframe(snp_rows, use_container_width=True)
+    elif homolog_group:
+        st.info("找到同源序列但未检测到 SNP，三个亚基因组高度同源")
+    else:
+        st.info("未提取到完整同源组，将基于覆盖度分析设计引物")
+
+    # ── Step 3: 构建特异性图谱 ────────────────────────────────
+    st.markdown(f"#### ③ 识别 {target_genome} 亚基因组特异性区域…")
+    specific_regions = analyze_specificity_for_design(
+        gene_seq, gene_blast,
+        target_genome=target_genome,
+        min_region_len=20,
+        homolog_group=homolog_group,
+    )
+
+    if specific_regions:
+        st.success(f"✅ 找到 {len(specific_regions)} 个特异性区域")
+        for r in specific_regions[:3]:
+            snp_tag = f" | **含 {r['snp_count']} 个 SNP**" if r.get('snp_count', 0) > 0 else ""
+            st.info(f"位置 {r['start']+1}–{r['end']} bp（{r['length']} bp）| {r['reason']}{snp_tag}")
+    else:
+        st.warning(
+            f"⚠️ 未找到明确的 {target_genome} 亚基因组特异区域。"
+            "将在全序列上设计引物，特异性依赖 3'端 SNP。"
+        )
+        specific_regions = [{"start": 0, "end": len(gene_seq),
+                              "length": len(gene_seq), "score": 50.0,
+                              "sequence": gene_seq, "snp_count": 0,
+                              "reason": "全序列（未找到特异区）"}]
+
+    # ── Step 4: 在特异区段设计候选引物（SNP 引导）───────────
+    st.markdown("#### ④ 在特异区域内设计候选引物…")
+
+    directions = []
+    if direction_str == "正向 (Forward)":
+        directions = ["forward"]
+    elif direction_str == "反向 (Reverse)":
+        directions = ["reverse"]
+    else:
+        directions = ["forward", "reverse"]
+
+    # 构建 SNP 位置集合
+    snp_positions = set()
+    if homolog_group and homolog_group.snp_sites:
+        for snp in homolog_group.snp_sites:
+            snp_positions.add(snp.position)
+
+    all_candidates = []
+    for region in specific_regions[:5]:
+        region_seq = region["sequence"]
+        r_start = region["start"]
+
+        for direction in directions:
+            scan_seq = region_seq if direction == "forward" else reverse_complement(region_seq)
+            for plen in range(18, 26):
+                for pos in range(0, max(1, len(scan_seq) - plen), 2):
+                    subseq = scan_seq[pos: pos + plen]
+                    if len(subseq) < 18:
+                        continue
+                    qual = evaluate_primer_quality(subseq)
+                    if qual["score"] < 50:
+                        continue
+
+                    if direction == "forward":
+                        global_pos = r_start + pos
+                        three_prime_global = global_pos + plen - 1
+                    else:
+                        global_pos = r_start + len(region_seq) - pos - plen
+                        three_prime_global = global_pos
+
+                    # SNP 加分：3' 端落在 SNP 上大幅加分
+                    snp_bonus = 0.0
+                    snp_in_primer = 0
+                    three_prime_snp = False
+                    for offset in range(plen):
+                        check_pos = (global_pos + offset) if direction == "forward" else (global_pos + plen - 1 - offset)
+                        if check_pos in snp_positions:
+                            snp_in_primer += 1
+                            if offset >= plen - 3:  # 3' 端最后 3 个碱基
+                                snp_bonus += 25.0
+                                if offset == plen - 1:
+                                    three_prime_snp = True
+                            elif offset >= plen - 6:
+                                snp_bonus += 10.0
+
+                    pre_score = qual["score"] * 0.35 + region["score"] * 0.40 + min(snp_bonus, 30) * 0.25 + snp_bonus * 0.1
+
+                    all_candidates.append({
+                        "sequence": subseq,
+                        "direction": direction,
+                        "global_position": global_pos,
+                        "length": plen,
+                        "quality_score": qual["score"],
+                        "tm": qual["tm"],
+                        "gc": qual["gc_content"],
+                        "region_score": region["score"],
+                        "pre_score": pre_score,
+                        "blast_specificity": None,
+                        "three_prime_snp": three_prime_snp,
+                        "snp_count_in_primer": snp_in_primer,
+                    })
+
+    # 去重，取综合前 15 条
+    seen: set = set()
+    unique_candidates = []
+    for c in sorted(all_candidates, key=lambda x: x["pre_score"], reverse=True):
+        key = (c["sequence"], c["direction"])
+        if key not in seen:
+            seen.add(key)
+            unique_candidates.append(c)
+        if len(unique_candidates) >= 15:
+            break
+
+    if not unique_candidates:
+        st.error("未找到合格候选引物（质量评分 <50），请检查序列质量或适当放宽参数")
+        return
+
+    snp_primers = sum(1 for c in unique_candidates if c["three_prime_snp"])
+    st.success(
+        f"✅ 筛选出 {len(unique_candidates)} 条候选引物"
+        f"（其中 {snp_primers} 条 3' 端落在 SNP 上）"
+    )
+
+    # ── Step 5: BLAST 回验最优 5 条 ──────────────────────────
+    if do_verify:
+        st.markdown("#### ⑤ BLAST 回验最优 5 条候选引物…")
+        to_verify = unique_candidates[:5]
+        total = len(to_verify)
+        prog = st.progress(0.0)
+
+        for i, cand in enumerate(to_verify):
+            prog.progress(i / total)
+            with st.spinner(f"回验第 {i+1}/{total} 条：{cand['sequence']}"):
+                try:
+                    r = blast_sequence_ncbi(
+                        cand["sequence"],
+                        entrez_query="Triticum aestivum[Organism]",
+                        hitlist=20,
+                        email=email,
+                    )
+                    cand["blast_result"] = r
+                    cand["blast_specificity"] = r.specificity_score if r else 0
+                except Exception as e:
+                    cand["blast_result"] = None
+                    cand["blast_specificity"] = 0
+                    st.warning(f"回验失败：{e}")
+            if i < total - 1:
+                time.sleep(3.5)
+
+        prog.progress(1.0)
+        st.success("✅ 回验完成！")
+
+        for c in to_verify:
+            snp_factor = 8 if c["three_prime_snp"] else 0
+            c["final_score"] = (
+                c["quality_score"] * 0.30
+                + (c["blast_specificity"] or 0) * 0.45
+                + c["region_score"] * 0.15
+                + snp_factor
+                + min(c["snp_count_in_primer"] * 2, 6) * 0.10
+            )
+        unique_candidates[:5] = to_verify
+
+    unique_candidates.sort(
+        key=lambda x: x.get("final_score", x["pre_score"]), reverse=True
+    )
+
+    st.session_state["sd_results"] = {
+        "gene_length": len(gene_seq),
+        "target_genome": target_genome,
+        "candidates": unique_candidates,
+        "specific_regions": specific_regions[:5],
+        "homolog_group": homolog_group,
+    }
+    st.rerun()
+
+
+def _display_smart_design_results():
+    """显示智能设计完成后的结果（v2 增强版：含 SNP 信息）"""
+    data = st.session_state.get("sd_results", {})
+    candidates = data.get("candidates", [])
+    if not candidates:
+        return
+
+    st.markdown("---")
+    st.markdown("### 🏆 智能设计结果")
+
+    col1, col2, col3 = st.columns(3)
+    col1.info(f"分析基因长度：{data['gene_length']} bp")
+    col2.info(f"目标亚基因组：{data['target_genome']}")
+    hg = data.get("homolog_group")
+    if hg and hg.snp_sites:
+        col3.info(f"检测到 {len(hg.snp_sites)} 个 SNP/InDel")
+
+    best = candidates[0]
+    blast_line = (
+        f"| BLAST 特异性：**{best['blast_specificity']:.0f}/100**"
+        if best.get("blast_specificity") is not None else ""
+    )
+    snp_line = " | **3'端 SNP ✓**" if best.get("three_prime_snp") else ""
+    st.success(
+        f"**🥇 最优推荐引物**\n\n"
+        f"序列：`{best['sequence']}`\n\n"
+        f"方向：{best['direction']} | 长度：{best['length']} bp | "
+        f"Tm：{best['tm']}°C | GC：{best['gc']:.1f}% | "
+        f"质量评分：{best['quality_score']:.0f}/100 {blast_line}{snp_line}"
+    )
+
+    # 全部候选表格
+    rows = []
+    for i, c in enumerate(candidates):
+        rows.append({
+            "排名": i + 1,
+            "序列 (5'→3')": c["sequence"],
+            "方向": c["direction"],
+            "长度": c["length"],
+            "Tm (°C)": c["tm"],
+            "GC%": f"{c['gc']:.1f}",
+            "位置 (bp)": c["global_position"],
+            "质量评分": f"{c['quality_score']:.0f}",
+            "区域特异性": f"{c['region_score']:.0f}",
+            "BLAST 特异性": (
+                f"{c['blast_specificity']:.0f}"
+                if c.get("blast_specificity") is not None else "—"
+            ),
+            "3'SNP": "✓" if c.get("three_prime_snp") else "",
+            "SNP数": c.get("snp_count_in_primer", 0),
+        })
+    st.dataframe(rows, use_container_width=True)
+
+    # 特异性区域概览
+    regions = data.get("specific_regions", [])
+    if regions:
+        with st.expander("📊 特异性区域概览", expanded=False):
+            for r in regions:
+                snp_tag = f"（含 {r.get('snp_count', 0)} 个 SNP）" if r.get('snp_count', 0) > 0 else ""
+                st.caption(f"位置 {r['start']+1}–{r['end']} bp | 评分 {r['score']:.0f} | {r['reason']}{snp_tag}")
+
+    if st.button("🗑️ 清除结果，重新设计", key="clear_sd"):
+        for k in ("sd_results", "sd_seq", "sd_params"):
+            st.session_state.pop(k, None)
+        st.rerun()
+
+
 def show_help():
     """帮助文档"""
     st.markdown("### 📖 使用帮助")
@@ -5527,7 +6224,8 @@ def main():
     st.sidebar.markdown("---")
     
     # 使用session_state管理页面选择，支持程序内跳转
-    page_options = ["🏠 首页", "🔬 KASP引物设计", "🧪 常规PCR引物设计", "🔍 引物分析", "📖 帮助文档"]
+    page_options = ["🏠 首页", "🔬 KASP引物设计", "🧪 常规PCR引物设计", "🔍 引物分析",
+                    "🌐 BLAST 验证", "🌾 智能引物设计", "📖 帮助文档"]
     current_index = page_options.index(st.session_state['page']) if st.session_state['page'] in page_options else 0
     
     # Radio选择，不使用key自动binding，而是手动更新
@@ -5569,9 +6267,17 @@ def main():
     - 🔬 LGC标准人工错配
     - 🆘 AT-rich序列救援模式
     - ⚖️ ASP-Common Tm平衡
+    - 🌐 NCBI BLAST 特异性验证
+    - 🌾 小麦智能引物设计
     
     </small>
     """, unsafe_allow_html=True)
+
+    # BLAST 模块状态（不在侧边栏触发加载，仅显示已加载状态）
+    if BLAST_MODULE_AVAILABLE and BLAST_TOOL_AVAILABLE:
+        st.sidebar.success("✅ BLAST 模块已就绪")
+    else:
+        st.sidebar.info("ℹ️ BLAST 模块将在使用时加载")
     
     # 页面路由
     if page == "🏠 首页":
@@ -5687,7 +6393,13 @@ def main():
     
     elif page == "🔍 引物分析":
         show_primer_analysis()
-    
+
+    elif page == "🌐 BLAST 验证":
+        show_blast_verification()
+
+    elif page == "🌾 智能引物设计":
+        show_wheat_smart_design()
+
     elif page == "📖 帮助文档":
         show_help()
 
